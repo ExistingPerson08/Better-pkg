@@ -12,6 +12,7 @@
 - **Security checks** (firewall, SELinux, auditd, fail2ban, sudoers, ...)
 - **Colorful, user-friendly output**
 - **Aliases and custom configuration support**
+- **Install app that are not in distros repo**, from its github or official site
 
 ## Installation
 
