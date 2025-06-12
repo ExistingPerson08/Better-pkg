@@ -1,0 +1,4381 @@
+#!/usr/bin/env python3
+import os
+import sys
+import sys
+import subprocess
+import argparse
+import re
+import shutil
+import signal
+import json
+import requests
+import importlib.util
+
+from time import sleep
+from typing import List, Tuple
+from concurrent.futures import ThreadPoolExecutor
+
+#handler for ctrl+c
+def signal_handler(sig, frame):
+    print('\nScript was interrupted. \n⚠️ If you interrupted the script during update/installation process, clean up your system (using cleanup command) and remove cache (using cache command)! ⚠️')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+try:
+    subprocess.run(["dbus-launch"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+except subprocess.CalledProcessError:
+    pass
+
+class Colors:
+    def __init__(self):
+        self.use_color = "NO_COLOR" not in os.environ
+        if self.use_color:
+            self.NC = '\033[0m'
+            self.BGreen = '\033[1;32m'
+            self.BCyan = '\033[1;36m'
+            self.BYellow = '\033[1;33m'
+            self.BPurple = '\033[1;35m'
+            self.BRed = '\033[1;31m'
+            self.BWhite = '\033[1;37m'
+            self.c1 = '\u001b[38;5;104m'  # light purple
+            self.c2 = '\u001b[0m'         # white/reset
+            self.c3 = '\u001b[38;5;55m'   # dark purple
+            self.c4 = '\u001b[38;5;98m'   # medium purple
+        else:
+            self.NC = self.BGreen = self.BCyan = self.BYellow = ''
+            self.BPurple = self.BRed = self.BWhite = ''
+            self.c1 = self.c2 = self.c3 = self.c4 = ''
+
+def print_status(message, status="info"):
+        """Barevný výpis stavových zpráv"""
+        colors = Colors()
+        if status == "info":
+            print(f"{colors.BCyan}ℹ {message}{colors.NC}")
+        elif status == "success":
+            print(f"{colors.BGreen}✓ {message}{colors.NC}")
+        elif status == "warning":
+            print(f"{colors.BYellow}⚠ {message}{colors.NC}")
+        elif status == "error":
+            print(f"{colors.BRed}✗ {message}{colors.NC}")
+
+# podpora pluginů
+
+HOOKS = {
+    "update-plugin": [],
+    "upgrade-plugin": [],
+    "cleanup-plugin": [],
+}
+
+PACKAGE_GROUPS_EXTENSIONS = []
+SETUP_FUNCTIONS = {}
+CUSTOM_JSON_HANDLERS = {}
+PLUGIN_COMMANDS = []
+
+def load_plugins(command_handlers, hooks, setup_functions=None, package_groups_extensions=None, custom_json_handlers=None):
+    plugins_dir = os.path.expanduser("~/.local/share/better-tools/plugins/")
+    if not os.path.isdir(plugins_dir):
+        return
+    for fname in os.listdir(plugins_dir):
+        if fname.endswith(".py") and not fname.startswith("_"):
+            plugin_path = os.path.join(plugins_dir, fname)
+            modname = f"plugin_{fname[:-3]}"
+            try:
+                spec = importlib.util.spec_from_file_location(modname, plugin_path)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    if hasattr(mod, "register"):
+                        # Vždy předávej všechny argumenty ve správném pořadí
+                        mod.register(
+                            command_handlers,
+                            hooks,
+                            setup_functions,
+                            package_groups_extensions,
+                            custom_json_handlers
+                        )
+            except Exception as e:
+                print(f"Failed to load plugin {fname}: {e}")
+
+
+def convert_shortcut(args_list):
+    """Převádí zkrácené příkazy na dlouhé a rozkládá kombinované přepínače"""
+    shortcut_map = {
+        '-S': 'install',
+        '-R': 'remove',
+        '-L': 'list',
+        '-Q': 'package',
+        '-D': 'discover',
+        '-F': 'search',
+        '-U': 'update',
+        '-G': 'upgrade',
+        '-C': 'cleanup',
+        '-Y': 'repair',
+        '-K': 'cache',
+        '-J': 'setup',
+        '-Jc': 'setup-custom',
+        '-Je': 'setup-export',
+        '-Jr': 'setup-remove',
+        '-X': 'check',
+        '-V': 'version'
+    }
+
+    converted = []
+    i = 0
+    while i < len(args_list):
+        arg = args_list[i]
+
+        # Převod zkrácených příkazů
+        if arg in shortcut_map:
+            converted.append(shortcut_map[arg])
+            i += 1
+        # Rozklad kombinovaných přepínačů (-Syu → install -y -u)
+        elif arg.startswith('-') and len(arg) > 2 and not arg.startswith('--'):
+            # První znak je příkaz
+            if f'-{arg[1]}' in shortcut_map:
+                converted.append(shortcut_map[f'-{arg[1]}'])
+            # Zbylé znaky jsou přepínače
+            for char in arg[2:]:
+                converted.append(f'-{char}')
+            i += 1
+        else:
+            converted.append(arg)
+            i += 1
+
+    return converted
+
+def setup_argparse():
+    parser = argparse.ArgumentParser(
+        description='An universal package manager wrapper.',
+        add_help=True
+    )
+
+    # Přidání subparseru pro příkazy
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # Install command
+    install_parser = subparsers.add_parser('install', help='Install package(s)')
+    install_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    install_parser.add_argument('-f', '--first', action='store_true', help='Automatically install the first package')
+    install_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
+    install_parser.add_argument('-g', '--fetch', action='store_true', help='Fetch package from official source.')
+    install_parser.add_argument('-c', '--plugin', action='store_true', help='Install better-pkg plugin.')
+    install_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
+    install_parser.add_argument('package', nargs='+', help='Package(s) to install')
+
+    # Remove command
+    remove_parser = subparsers.add_parser('remove', help='Remove package(s)')
+    remove_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    remove_parser.add_argument('-f', '--first', action='store_true', help='Automatically install the first package')
+    remove_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
+    remove_parser.add_argument('-c', '--plugin', action='store_true', help='Remove better-pkg plugin.')
+    remove_parser.add_argument('-p', '--purge', action='store_true', help='Delete package with data.')
+    remove_parser.add_argument('package', nargs='+', help='Package(s) to remove')
+
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search for package(s)')
+    search_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    search_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
+    search_parser.add_argument('package', nargs='+', help='Package(s) to search for')
+
+    # Update command
+    update_parser = subparsers.add_parser('update', help='Just update packages from package manager.')
+    update_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # Upgrade command
+    upgrade_parser = subparsers.add_parser('upgrade', help='Upgrade all packages, extensions, themes and more.')
+    upgrade_parser.add_argument('-s', '--skip-pre-upgrade', action='store_true', help='Skip pre-upgrade actions (not user defined).')
+    upgrade_parser.add_argument('-n', '--use-native', action='store_true', help='Use native way to upgrade (e.g. instead of Garuda update use pacman).')
+    upgrade_parser.add_argument('-m', '--skip-mirrors', action='store_true', help='Skip refreshing mirrorlist.')
+    upgrade_parser.add_argument('-f', '--skip-firmware', action='store_true', help='Skip upgrading firmware.')
+    upgrade_parser.add_argument('-d', '--distro', action='store_true', help='Upgrade whole distro to next release if avaible.')
+    upgrade_parser.add_argument('-b', '--unreleased', action='store_true', help='Upgrade whole distro to next unreleased (beta, alpha, dev) release if avaible.')
+    upgrade_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # Cleanup command
+    cleanup_parser = subparsers.add_parser('cleanup', help='Remove unused packages')
+    cleanup_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # Repair command
+    repair_parser = subparsers.add_parser('repair', help='Try to repair broken packages')
+    repair_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # List command
+    list_parser = subparsers.add_parser('list', help='List installed packages')
+    list_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    list_parser.add_argument('-u', '--user', action='store_true', help='List only user-installed packages')
+    list_parser.add_argument('-o', '--outdated', action='store_true', help='List outdated packages')
+    list_parser.add_argument('-n', '--unused', action='store_true', help='List unused packages')
+    list_parser.add_argument('-c', '--plugin', action='store_true', help='List installed better-pkg plugins')
+    list_parser.add_argument('-r', '--repo',  nargs='+', help='List all packages from the repository (working only with system package managers and not with pacman')
+
+    # Setup command
+    setup_parser = subparsers.add_parser('setup', help='Setup your system. Install codecs, games, and more')
+    setup_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+    setup_parser.add_argument('setup', nargs='+', help='Choose what to setup.')
+    setup_parser.add_argument('--list-options', action='store_true', help='List available setup options')
+
+    # Setup-custom command
+    setup_custom_parser = subparsers.add_parser('setup-custom', help='Install and setup packages from your own configuration file')
+    setup_custom_parser.add_argument('config_file', help='Path to the configuration file')
+    setup_custom_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # Setup-remove command
+    setup_remove_parser = subparsers.add_parser('setup-remove', help='Remove packages from your own configuration file')
+    setup_remove_parser.add_argument('config_file', help='Path to the configuration file')
+    setup_remove_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    #Cache commands
+    cache_parser = subparsers.add_parser('cache', help='Remove package cache')
+    cache_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    #Discover commands
+    discover_parser = subparsers.add_parser('discover', help='Discover new packages')
+
+    #Check commands
+    check_parser = subparsers.add_parser('check', help='Check (and refresh) packages, services and repositories')
+    check_parser.add_argument('check', nargs='+', help='Choose what to check.')
+    check_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    check_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # Setup-export command
+    setup_export_parser = subparsers.add_parser('setup-export', help='Export package list to configuration file.')
+    setup_export_parser.add_argument('package', nargs='+', help='Package(s) to export. Type c-all to export all packages and c-category to export packages from a specific category.')
+
+    # Package command
+    package_parser = subparsers.add_parser('package', help='Manage and view info about package.')
+    package_parser.add_argument('-i', '--info', action='store_true', help='Display information about package')
+    package_parser.add_argument('-s', '--status', action='store_true', help='Check package status')
+    package_parser.add_argument('-u', '--update', action='store_true', help='Check if update is available')
+    package_parser.add_argument('-c', '--hold', action='store_true', help='Hold package')
+    package_parser.add_argument('-n', '--unhold', action='store_true', help='Unhold package')
+    package_parser.add_argument('-r', '--repo', action='store_true', help='Show from which repository the package is installed')
+    package_parser.add_argument('package', help='Package name')
+
+    version_parser = subparsers.add_parser('version', help='Show version.')
+
+    # Plugin command
+    for name, func, help_text in PLUGIN_COMMANDS:
+        subparsers.add_parser(name, help=help_text)
+
+    return parser
+
+# definice vyhledávání
+
+def msg(*args):
+    input_text = " ".join(args)
+    print(input_text)
+
+def prompt(input_text, index):
+    print(f"{input_text} [0-{index}]: \033[97m", end="")
+
+def search_pacstall(*args, description=None):
+    command = ['pacstall', '-S', *args]
+    if description:
+        command[1] = '-Sd'  # Hledání i v popisech
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        contents = []
+        for line in re.sub(r'\x1B\[[0-9;]*[A-Za-z]', '', result.stdout).splitlines():
+            if line and not line.startswith(' '):  # Přeskočit prázdné řádky a popis
+                pkg_name = line.split()[0]
+                contents.append(pkg_name)
+        return contents if contents else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_apt(*args, description=None):
+    if description:
+        command = ['apt', 'search', *args]
+    else:
+        command = ['apt', 'search', '--names-only', *args]
+
+    try:
+        env = os.environ.copy()
+        env['LANG'] = 'C'  # Zajistí konzistentní výstup bez lokalizace
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
+
+        contents = []
+        for line in result.stdout.splitlines():
+            if line.startswith('Sorting...') or line.startswith('Full Text Search...') or not line:
+                continue
+
+            if line.startswith('/'):  # Přeskočí řádky začínající /
+                continue
+
+            parts = line.split('/', 1)  # Rozdělí na název a zbytek
+            if len(parts) >= 1:
+                pkg_name = parts[0].strip()
+                if pkg_name and pkg_name not in contents:
+                    contents.append(pkg_name)
+
+        return contents if contents else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_dnf(*args, description=None):
+    command = ['dnf', 'search']
+    if description:
+        command.append('--all')
+    command.extend(args)
+
+    if shutil.which('bootc') or shutil.which('rpm-ostree'):
+        return None  # DNF není podporován v těchto systémech
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        contents = []
+        for line in result.stdout.splitlines():
+            if line and not line.startswith('Last metadata') and not line.startswith('='):  # Přeskočit metadata a oddělovače
+                # Extrahuje název balíčku před první mezerou nebo dvojtečkou
+                pkg_name = line.split()[0].split('.')[0]
+                if pkg_name and pkg_name not in contents:
+                    contents.append(pkg_name)
+        return contents if contents else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_flatpak(*args, description=None):
+    command = ['flatpak', 'search', '--columns=application', *args]
+    if description:
+        command = ['flatpak', 'search', *args]  # Při description=True hledáme i v popisech
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        lines = result.stdout.splitlines()
+        if len(lines) <= 1:  # Jen hlavička nebo prázdný výstup
+            return None
+        # Vrátit seznam aplikací bez hlavičky
+        contents = []
+        for line in lines[1:]:  # Přeskočit hlavičku
+            if line.strip():
+                pkg_name = line.split()[0]
+                contents.append(pkg_name)
+        return contents if contents else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_snap(*args, description=None):
+    command = ['snap', 'find', *args]
+    if not description:
+        command.extend(['--section', 'name'])  # Hledat pouze v názvech
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        contents = []
+        for line in result.stdout.splitlines()[1:]:  # Přeskočit hlavičku
+            if line.strip():
+                pkg_name = line.split()[0]
+                contents.append(pkg_name)
+        return contents if contents else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_pacman(*args, description=None):
+    command = ['pacman', '-Ss', *args]  # Vždy používáme -Ss, protože -Fs hledá v souborech
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        packages = []
+        for line in result.stdout.splitlines():
+            if line.startswith(' '):  # Přeskočit řádky s popisem
+                continue
+            if '/' in line:  # Řádky s názvy balíčků obsahují '/'
+                pkg_name = line.split('/')[1].split(' ')[0]
+                # Pokud nehledáme v popisech, kontrolujeme, zda se hledaný výraz nachází v názvu
+                if not description:
+                    search_term = args[0].lower()
+                    if search_term in pkg_name.lower():
+                        packages.append(pkg_name)
+                else:
+                    packages.append(pkg_name)
+        return packages if packages else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_zypper(*args, description=False):
+    command = ['zypper', 'search']
+    if description:
+        command.append('-d')  # Hledání i v popisech
+    command.extend(args)
+
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+
+        contents = []
+        for line in re.sub(r'\x1B\[[0-9;]*[A-Za-z]', '', result.stdout).splitlines():
+            if line and not line.startswith(" ") and not line.startswith("---"):
+                columns = line.split('|')
+                if len(columns) > 1:
+                    pkg_name = columns[1].strip()  # Název balíčku je ve druhém sloupci
+                    contents.append(pkg_name)
+
+        return contents if contents else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_yay(*args, description=None):
+    command = ['yay', '-Ssa', *args]  # Vždy používáme -Ss, protože -Fs hledá v souborech
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        packages = []
+        for line in result.stdout.splitlines():
+            if line.startswith(' '):  # Přeskočit řádky s popisem
+                continue
+            if '/' in line:  # Řádky s názvy balíčků obsahují '/'
+                pkg_name = line.split('/')[1].split(' ')[0]
+                # Pokud nehledáme v popisech, kontrolujeme, zda se hledaný výraz nachází v názvu
+                if not description:
+                    search_term = args[0].lower()
+                    if search_term in pkg_name.lower():
+                        packages.append(pkg_name)
+                else:
+                    packages.append(pkg_name)
+        return packages if packages else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_paru(*args, description=None):
+    command = ['paru', '-Ssa', *args]  # Přidání -A pro hledání pouze v AUR
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            return None
+        packages = []
+        for line in result.stdout.splitlines():
+            if line.startswith(' '):  # Přeskočit řádky s popisem
+                continue
+            if '/' in line:  # Řádky s názvy balíčků obsahují '/'
+                pkg_name = line.split('/')[1].split(' ')[0]
+                # Pokud nehledáme v popisech, kontrolujeme, zda se hledaný výraz nachází v názvu
+                if not description:
+                    search_term = args[0].lower()
+                    if search_term in pkg_name.lower():
+                        packages.append(pkg_name)
+                else:
+                    packages.append(pkg_name)
+        return packages if packages else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_brew(*args, description=None):
+    """Vyhledá balíčky v Homebrew."""
+    command = ['brew', 'search', *args]  # Odstraníme --name, protože nefunguje
+    try:
+        env = os.environ.copy()
+        env['PATH'] = f"/home/linuxbrew/.linuxbrew/bin:{env['PATH']}"
+        result = subprocess.run(command, capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            return None
+
+        packages = []
+        search_term = args[0].lower()
+        for line in result.stdout.splitlines():
+            if line.strip() and not line.startswith('==>'):
+                pkg_name = line.strip()
+                # Pokud nehledáme v popisech, kontrolujeme, zda se hledaný výraz nachází v názvu
+                if not description:
+                    if search_term in pkg_name.lower():
+                        packages.append(pkg_name)
+                else:
+                    packages.append(pkg_name)
+        return packages if packages else None
+    except subprocess.CalledProcessError:
+        return None
+
+def search_betterpkg(*args, description=None):
+    """
+    Vyhledá balíčky v verified_urls.json (Better-pkg "repo").
+    """
+    url = "https://raw.githubusercontent.com/ExistingPerson08/Better-pkg-data/main/verified_urls.json"
+    if shutil.which("apt") or shutil.which("dnf") and not shutil.which("rpm-ostree") or shutil.which("zypper"):
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+        except Exception:
+            return None
+
+        if not args or not args[0]:
+            return None
+        search_term = args[0].lower()
+        packages = []
+        for pkg_name in data.keys():
+            if not description:
+                if search_term in pkg_name.lower():
+                    packages.append(pkg_name)
+            else:
+                packages.append(pkg_name)
+        return packages if packages else None
+    else:
+        return None  # Better-pkg není podporován v těchto systémech
+
+# definice configu
+
+# Cesta k souboru s aliasy a příkazy před/po aktualizaci
+CONFIG_PATH = os.path.expanduser("~/.config/better-tools/pkg.json")
+
+# Výchozí aliasy
+ALIASES = {
+    "@a-browsers": ["brave", "firefox", "chrome", "chromium", "vivaldi", "opera"],
+    "@a-editors": ["vim", "nano", "emacs", "code", "zed", "sublime-text"],
+    "@a-office": ["libreoffice", "onlyoffice", "calligra-suite", "openoffice"],
+    "@a-media": ["vlc", "mpv", "gimp", "audacity", "inkscape", "shotcut", "obs-studio", "kdenlive"],
+    "@a-graphics": ["gimp", "inkscape", "blender", "krita", "darktable"],
+    "@a-development": ["git", "docker", "vscode", "atom", "intellij-idea", "pycharm", "eclipse"],
+    "@a-system-tools": ["htop", "fastfetch", "nmap", "net-tools", "curl", "wget"],
+    "@a-security": ["ufw", "fail2ban", "clamav", "nmap", "gnupg"],
+    "@a-networking": ["openvpn", "tor", "wireguard", "curl", "nmap"],
+    "@a-cloud": ["docker", "kubectl", "terraform", "minikube", "ansible"],
+    "@a-gaming": ["steam", "lutris", "discord", "epic-games", "bottles"],
+    "@a-gaming-tools": ["goverlay", "mangohud", "piper", "corectrl", "obs-studio", "winetricks"],
+    "@a-fonts": ["font-awesome", "noto-fonts", "ttf-dejavu", "ttf-ms-fonts"],
+    "@a-utilities": ["htop", "fastfetch", "tree", "jq", "vim", "tmux", "wget"],
+
+    # Alias pro desktopová prostředí
+    "@a-de-gnome": ["gnome-shell", "gnome-tweaks", "gnome-terminal", "nautilus", "gdm"],
+    "@a-de-kde": ["plasma-desktop", "kde-applications", "konsole", "dolphin", "sddm"],
+    "@a-de-xfce": ["xfce4", "xfce4-goodies", "thunar", "xfce4-terminal", "lightdm", "lightdm-gtk-greeter"],
+    "@a-de-lxde": ["lxde", "pcmanfm", "lxterminal", "openbox", "lightdm"],
+    "@a-de-lxqt": ["lxqt", "lxqt-panel", "pcmanfm-qt", "qterminal", "sddm"],
+    "@a-de-mate": ["mate", "mate-extra", "caja", "mate-terminal", "lightdm", "lightdm-gtk-greeter"],
+    "@a-de-cinnamon": ["cinnamon", "nemo", "cinnamon-control-center", "cinnamon-settings-daemon", "lightdm", "touchegg"],
+    "@a-de-budgie": ["budgie-desktop", "budgie-extras", "nautilus", "lightdm"],
+    "@a-de-deepin": ["deepin", "deepin-extra", "deepin-terminal", "lightdm"],
+    "@a-wm-i3": ["i3", "i3status", "i3lock", "dmenu", "rofi", "alacritty"],
+    "@a-wm-sway": ["sway", "swaylock", "swayidle", "waybar", "foot"],
+    "@a-wm-awesome": ["awesome", "lxappearance", "rofi", "alacritty"],
+    "@a-wm-bspwm": ["bspwm", "sxhkd", "rofi", "alacritty"],
+    "@a-wm-hyprland": ["hyprland", "waybar", "swaylock", "alacritty"]
+}
+
+# Výchozí aliasy a příkazy
+CONFIG_DEFAULT = {
+    "aliases": {
+        "@a-my-fav": ["firefox", "ghostty", "nautilus"]
+    },
+    "pre_update_commands": [],
+    "post_update_commands": [],
+    "pre_upgrade_commands": [],
+    "post_upgrade_commands": [],
+}
+
+def load_config():
+    """Načte konfiguraci ze souboru, pokud existuje, nebo vytvoří výchozí."""
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as file:
+                return json.load(file)
+        except (json.JSONDecodeError, IOError):
+            print("Chyba při načítání konfigurace, vrací výchozí.")
+    else:
+        # Pokud soubor neexistuje, vytvoří se s výchozí konfigurací
+        save_config(CONFIG_DEFAULT)
+        return CONFIG_DEFAULT
+
+def save_config(config):
+    """Uloží konfiguraci do souboru."""
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as file:
+            json.dump(config, file, indent=4)
+        print(f"Konfigurace byla uložena do: {CONFIG_PATH}")
+    except IOError as e:
+        print(f"Chyba při ukládání konfigurace: {e}")
+
+config = load_config()
+PRE_UPDATE_COMMANDS = config["pre_update_commands"]
+POST_UPDATE_COMMANDS = config["post_update_commands"]
+PRE_UPGRADE_COMMANDS = config["pre_upgrade_commands"]
+POST_UPGRADE_COMMANDS = config["post_upgrade_commands"]
+
+file_aliases = config["aliases"]
+ALIASES.update(file_aliases)
+
+def resolve_aliases(packages):
+    """Rozšíří aliasy v seznamu balíčků na skutečné názvy balíčků."""
+    resolved = set()
+    for pkg in packages:
+        if pkg in ALIASES:
+            resolved.update(ALIASES[pkg])
+        else:
+            resolved.add(pkg)
+    return list(resolved)
+
+# další definice
+
+def run_command(command):
+    try:
+        subprocess.run(command, shell=True, check=True)
+    except subprocess.CalledProcessError:
+        pass
+
+def install_package(pkgs, repo):
+    """Instaluje balíčky podle správce balíčků."""
+    colors = Colors()
+
+    # Převedení na list, pokud je vstup string
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+
+    total_pkgs = len(pkgs)
+    failed_pkgs = []
+
+    print_status(f"Preparing to install {total_pkgs} package(s) using {repo}", "info")
+
+    # Příprava příkazu podle package manageru
+    if repo == "apt":
+        pkgs = ["steam-installer" if pkg == "steam" else pkg for pkg in pkgs]
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo nala install {pkg_str} -y" if shutil.which("nala") else f"sudo apt install {pkg_str} -y"
+    elif repo == "dnf":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo dnf install {pkg_str} -y"
+    elif repo == "pacman":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo pacman -S --noconfirm {pkg_str}"
+    elif repo == "zypper":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo zypper install {pkg_str} -y"
+    elif repo == "yay":
+        pkg_str = " ".join(pkgs)
+        cmd = f"yay -S --noconfirm {pkg_str}"
+    elif repo == "paru":
+        pkg_str = " ".join(pkgs)
+        cmd = f"paru -S --noconfirm {pkg_str}"
+    elif repo == "flatpak":
+        pkg_str = " ".join(pkgs)
+        cmd = f"flatpak install flathub {pkg_str} -y"
+    elif repo == "snap":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo snap install {pkg_str}"
+    elif repo == "brew":
+        pkg_str = " ".join(pkgs)
+        cmd = f"brew install {pkg_str}"
+    elif repo == "pacstall":
+        pkg_str = " ".join(pkgs)
+        cmd = f"pacstall -I {pkg_str}"
+    elif repo == "betterpkg":
+        # Pro Better-pkg použijeme příkaz pro instalaci z verified_urls.json
+        argsi = argparse.Namespace()
+        argsi.package = pkgs
+        argsi.fetch = True
+        argsi.y = True
+        install(argsi)
+    else:
+        print_status(f"Unsupported package manager: {repo}", "error")
+        return
+
+    # Instalace balíčků
+    print_status(f"Installing packages using {repo}...", "info")
+    print(f"\n{colors.BWhite}Packages to install:{colors.NC}")
+    for pkg in pkgs:
+        print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+    print()
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+
+        current_pkg = 1
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                # Detekce aktuálního balíčku podle výstupu
+                for pkg in pkgs:
+                    if pkg.lower() in output.lower():
+                        current_pkg += 1
+                print(output.strip())
+
+        return_code = process.poll()
+
+        if return_code == 0:
+            print()  # Nový řádek po progress baru
+            print_status("Installation completed successfully", "success")
+            print(f"\n{colors.BWhite}Successfully installed packages:{colors.NC}")
+            for pkg in pkgs:
+                print(f"{colors.BGreen}  • {pkg}{colors.NC}")
+        else:
+            print_status("Installation failed", "error")
+            print(f"\n{colors.BWhite}Failed to install packages:{colors.NC}")
+            for pkg in pkgs:
+                print(f"{colors.BRed}  • {pkg}{colors.NC}")
+
+    except Exception as e:
+        print_status(f"Error during installation: {str(e)}", "error")
+
+    if failed_pkgs:
+        print(f"\n{colors.BYellow}Warning: The following packages failed to install:{colors.NC}")
+        for pkg in failed_pkgs:
+            print(f"{colors.BRed}  • {pkg}{colors.NC}")
+
+    # Shrnutí instalace
+    print(f"\n{colors.BWhite}Installation Summary:{colors.NC}")
+    print(f"{colors.BCyan}Total packages processed: {total_pkgs}{colors.NC}")
+    print(f"{colors.BGreen}Successfully installed: {total_pkgs - len(failed_pkgs)}{colors.NC}")
+    if failed_pkgs:
+        print(f"{colors.BRed}Failed installations: {len(failed_pkgs)}{colors.NC}")
+
+def remove_package(pkgs, repo):
+    """Odstraňuje balíčky podle správce balíčků."""
+    colors = Colors()
+
+    # Převedení na list, pokud je vstup string
+    if isinstance(pkgs, str):
+        pkgs = [pkgs]
+
+    total_pkgs = len(pkgs)
+    failed_pkgs = []
+
+    print_status(f"Preparing to remove {total_pkgs} package(s) using {repo}", "info")
+
+    # Příprava příkazu podle package manageru
+    if repo == "apt":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo nala remove {pkg_str} -y" if shutil.which("nala") else f"sudo apt remove {pkg_str} -y"
+    elif repo == "dnf":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo dnf remove {pkg_str} -y"
+    elif repo == "pacman":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo pacman -R --noconfirm {pkg_str}"
+    elif repo == "zypper":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo zypper remove {pkg_str} -y"
+    elif repo == "yay":
+        pkg_str = " ".join(pkgs)
+        cmd = f"yay -R --noconfirm {pkg_str}"
+    elif repo == "paru":
+        pkg_str = " ".join(pkgs)
+        cmd = f"paru -R --noconfirm {pkg_str}"
+    elif repo == "flatpak":
+        pkg_str = " ".join(pkgs)
+        cmd = f"flatpak remove flathub {pkg_str} -y"
+    elif repo == "snap":
+        pkg_str = " ".join(pkgs)
+        cmd = f"sudo snap remove {pkg_str}"
+    elif repo == "brew":
+        pkg_str = " ".join(pkgs)
+        cmd = f"brew remove {pkg_str}"
+    elif repo == "pacstall":
+        pkg_str = " ".join(pkgs)
+        cmd = f"pacstall -R {pkg_str}"
+    elif repo == "betterpkg":
+        pkg_str = " ".join(pkgs)
+        if shutil.which("apt"):
+            cmd = f"sudo nala remove {pkg_str} -y" if shutil.which("nala") else f"sudo apt remove {pkg_str} -y"
+        elif shutil.which("dnf"):
+            cmd = f"sudo dnf remove {pkg_str} -y"
+        elif shutil.which("zypper"):
+            cmd = f"sudo zypper remove {pkg_str} -y"
+    else:
+        print_status(f"Unsupported package manager: {repo}", "error")
+        return
+
+    # Instalace balíčků
+    print_status(f"Removing packages using {repo}...", "info")
+    print(f"\n{colors.BWhite}Packages to remove:{colors.NC}")
+    for pkg in pkgs:
+        print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+    print()
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1
+        )
+
+        current_pkg = 1
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                # Detekce aktuálního balíčku podle výstupu
+                for pkg in pkgs:
+                    if pkg.lower() in output.lower():
+                        current_pkg += 1
+                print(output.strip())
+
+        return_code = process.poll()
+
+        if return_code == 0:
+            print()  # Nový řádek po progress baru
+            print_status("Remove completed successfully", "success")
+            print(f"\n{colors.BWhite}Successfully removed packages:{colors.NC}")
+            for pkg in pkgs:
+                print(f"{colors.BGreen}  • {pkg}{colors.NC}")
+        else:
+            print_status("Remove failed", "error")
+            print(f"\n{colors.BWhite}Failed to remove packages:{colors.NC}")
+            for pkg in pkgs:
+                print(f"{colors.BRed}  • {pkg}{colors.NC}")
+
+    except Exception as e:
+        print_status(f"Error during remove: {str(e)}", "error")
+
+    if failed_pkgs:
+        print(f"\n{colors.BYellow}Warning: The following packages failed to remove:{colors.NC}")
+        for pkg in failed_pkgs:
+            print(f"{colors.BRed}  • {pkg}{colors.NC}")
+
+    # Shrnutí odinstalace
+    print(f"\n{colors.BWhite}Remove Summary:{colors.NC}")
+    print(f"{colors.BCyan}Total packages processed: {total_pkgs}{colors.NC}")
+    print(f"{colors.BGreen}Successfully removed: {total_pkgs - len(failed_pkgs)}{colors.NC}")
+    if failed_pkgs:
+        print(f"{colors.BRed}Failed to remove: {len(failed_pkgs)}{colors.NC}")
+
+# hlavní funkce
+
+def handle_update(args):
+    colors = Colors()
+
+    if not args.y:
+        confirm = input(f"{colors.BYellow}Are you sure you want to update all packages? (y/N) {colors.NC}").strip().lower()
+        if not confirm.startswith('y'):
+            sys.exit(1)
+
+    # Před spuštěním příkazů, které se mají spustit před aktualizací
+    if PRE_UPDATE_COMMANDS:
+        for cmd in PRE_UPDATE_COMMANDS:
+            print(f"Running pre-update command: {cmd}")
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print(f"Pre-update command executed: {cmd}")
+            except subprocess.CalledProcessError:
+                print(f"Error during pre-update command: {cmd}")
+                return
+
+    def update_system_packages():
+        print_status("Updating system packages...")
+        try:
+            if shutil.which("nala"):
+                cmd = "sudo nala upgrade --full --no-autoremove -o Acquire::AllowReleaseInfoChange=true"
+                cmd += " -y" if args.y else ""
+            elif shutil.which("garuda-update"):
+                cmd = f"sudo garuda-update{' --noconfirm' if args.y else ''}"
+            elif shutil.which("bootc"):
+                cmd = f"sudo bootc update{' -y' if args.y else ''}"
+            elif shutil.which("rpm-ostree"):
+                cmd = f"sudo rpm-ostree update{' -y' if args.y else ''}"
+            elif shutil.which("dnf"):
+                cmd = f"sudo dnf update{' -y' if args.y else ''}"
+            elif shutil.which("pacman"):
+                cmd = "sudo pacman -Syu --noconfirm"
+            elif shutil.which("zypper"):
+                cmd = f"sudo zypper update{' -y' if args.y else ''}"
+            else:
+                cmd = f"sudo apt update --allow-releaseinfo-change && sudo apt upgrade{' -y' if args.y else ''}"
+
+            process = subprocess.run(cmd, shell=True, check=True)
+            print_status("System update completed successfully", "success")
+            return True
+        except subprocess.CalledProcessError:
+            print_status("Error during system update", "error")
+            return False
+
+    def update_additional_packages():
+        package_managers = {
+            "pacstall": "sudo pacstall -Up",
+            "yay": "yay -Sua --noconfirm",
+            "paru": "paru -Sua --noconfirm",
+            "flatpak": f"sudo flatpak update{' -y' if args.y else ''}",
+            "snap": "sudo snap refresh",
+            "brew": "brew upgrade"
+        }
+
+        for pm, cmd in package_managers.items():
+            if shutil.which(pm):
+                print_status(f"Updating {pm} packages...")
+                try:
+                    subprocess.run(cmd, shell=True, check=True)
+                    print_status(f"{pm} update completed successfully", "success")
+                except subprocess.CalledProcessError:
+                    print_status(f"Error updating {pm} packages", "error")
+
+    print_status("Starting system update...", "info")
+    if update_system_packages():
+        update_additional_packages()
+
+    for hook in HOOKS["update-plugin"]:
+        print("")
+        print_status(f"Running plugin: {getattr(hook, '__module__', str(hook))}", "info")
+        hook(args)
+
+    print("")
+
+    # Po spuštění příkazů, které se mají spustit po aktualizaci
+    if POST_UPDATE_COMMANDS:
+        for cmd in POST_UPDATE_COMMANDS:
+            print(f"Running post-update command: {cmd}")
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print(f"Post-update command executed: {cmd}")
+            except subprocess.CalledProcessError:
+                print(f"Error during post-update command: {cmd}")
+                return
+
+    print_status("Update process completed", "success")
+
+def handle_upgrade(args):
+    colors = Colors()
+
+    if not args.y:
+        confirm = input(f"{colors.BYellow}Are you sure you want to upgrade all packages? (y/N) {colors.NC}").strip().lower()
+        if not confirm.startswith('y'):
+            sys.exit(1)
+
+    if not args.skip_pre_upgrade:
+        if shutil.which("pacman"):
+            if not args.skip_mirrors:
+                print_status("Updating mirrors using Reflector...", "info")
+                run_command("sudo reflector --latest 10 --sort rate --save /etc/pacman.d/mirrorlist")
+            print_status("Updating pacman keyring...", "info")
+            run_command("sudo pacman-key --init")
+            run_command("sudo pacman-key --populate archlinux")
+            print_status("Updating database...", "info")
+            run_command("sudo pacman -Syy")
+        elif shutil.which("apt") and not args.skip_mirrors:
+            print_status("Updating apt (apt update)...", "info")
+            run_command("sudo apt update")
+
+    if PRE_UPGRADE_COMMANDS:
+        for cmd in PRE_UPGRADE_COMMANDS:
+            print(f"Running pre-upgrade command: {cmd}")
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print(f"Pre-upgrade command executed: {cmd}")
+            except subprocess.CalledProcessError:
+                print(f"Error during pre-upgrade command: {cmd}")
+                return
+
+    def upgrade_system():
+        try:
+            if shutil.which("pacman"):
+                cmd = "sudo pacman -Syyu --noconfirm"
+            elif shutil.which("garuda-update") and not args.use_native:
+                cmd = f"sudo garuda-update{' --noconfirm' if args.y else ''}{' --skip-mirrorlist' if args.skip_mirrors else ''}"
+            elif shutil.which("bootc"):
+                cmd = f"sudo bootc update{' -y' if args.y else ''}"
+            elif shutil.which("rpm-ostree"):
+                cmd = f"sudo rpm-ostree update{' -y' if args.y else ''}"
+            elif shutil.which("dnf"):
+                cmd = f"sudo dnf upgrade --refresh{' -y' if args.y else ''}"
+            elif shutil.which("zypper"):
+                cmd = f"sudo zypper update{' -y' if args.y else ''}"
+            else:
+                cmd = f"sudo apt dist-upgrade{' -y' if args.y else ''}"
+
+            subprocess.run(cmd, shell=True, check=True)
+            print_status("System upgrade completed successfully", "success")
+            return True
+        except subprocess.CalledProcessError:
+            print_status("Error during system upgrade", "error")
+            return False
+
+    def upgrade_firmware():
+        if not args.skip_firmware:
+            print_status("Starting firmware upgrade...")
+            if not shutil.which("fwupdmgr"):
+                print_status("fwupdmgr is not installed.", "error")
+            else:
+                subprocess.run(["fwupdmgr", "refresh"])
+                subprocess.run(["sudo", "fwupdmgr", "update"])
+                print_status("Firmware was upgraded, reboot if needed.", "success")
+
+    def upgrade_distro():
+        print_status("Starting distro upgrade...")
+        try:
+            if shutil.which("do-release-upgrade"):
+                cmd = f"sudo do-release-upgrade{' -d' if args.unreleased else ''}"
+            elif shutil.which("manjaro-update"):
+                cmd = f"sudo manjaro-update"
+            elif shutil.which("pop upgrade"):
+                cmd = f"sudo pop-upgrade release upgrade{' -f' if args.unreleased else ''}"
+            else:
+                print_status("Unsupported distro", "error")
+                cmd = ""
+            if cmd:
+                subprocess.run(cmd, shell=True, check=True)
+                print_status("System upgrade completed successfully", "success")
+                return True
+        except subprocess.CalledProcessError:
+            print_status("Error during system upgrade", "error")
+            return False
+
+    def upgrade_additional_packages():
+        package_managers = {
+            "pacstall": "sudo pacstall -Up",
+            "yay": "yay -Syua --noconfirm",
+            "paru": "paru -Syua --noconfirm",
+            "flatpak": f"sudo flatpak update{' -y' if args.y else ''}",
+            "snap": "sudo snap refresh",
+            "brew": "brew upgrade",
+            "distrobox": "distrobox upgrade --all"
+        }
+        for pm, cmd in package_managers.items():
+            if shutil.which(pm):
+                print_status(f"Upgrading {pm} packages...")
+                try:
+                    subprocess.run(cmd, shell=True, check=True)
+                    print_status(f"{pm} upgrade completed successfully", "success")
+                    print("")
+                except subprocess.CalledProcessError:
+                    print_status(f"Error upgrading {pm}", "error")
+                    print("")
+
+    def upgrade_plugins():
+        plugins_dir = os.path.expanduser("~/.local/share/better-tools/plugins/")
+        if not os.path.isdir(plugins_dir):
+            print_status("No plugins directory found.", "warning")
+            return
+        plugins = [f for f in os.listdir(plugins_dir) if f.endswith(".py") and not f.startswith("_")]
+        if not plugins:
+            print_status("No plugins installed.", "warning")
+            return
+        import urllib.request
+        for plugin in plugins:
+            plugin_name = plugin[:-3]
+            plugin_url = f"https://raw.githubusercontent.com/ExistingPerson08/Better-pkg-data/main/plugins/{plugin_name}.py"
+            plugin_path = os.path.join(plugins_dir, f"{plugin_name}.py")
+            try:
+                print_status(f"Updating plugin '{plugin_name}'...", "info")
+                urllib.request.urlretrieve(plugin_url, plugin_path)
+                print_status(f"Plugin '{plugin_name}' updated.", "success")
+            except Exception as e:
+                print_status(f"Failed to update plugin '{plugin_name}': {e}", "error")
+
+    print_status("Starting upgrade process...", "info")
+    print("")
+    upgrade_system()
+    print("")
+    print_status("Upgrading additional packages...", "info")
+    print("")
+    upgrade_additional_packages()
+    print_status("Upgrading plugins...", "info")
+    upgrade_plugins()    
+
+    for hook in HOOKS["upgrade-plugin"]:
+        print_status(f"Running plugin: {getattr(hook, '__module__', str(hook))}", "info")
+        hook(args)
+        print("")
+
+    if not args.skip_firmware:
+        upgrade_firmware()
+        print("")
+
+    if args.distro:
+        upgrade_distro()
+
+    if POST_UPGRADE_COMMANDS:
+        for cmd in POST_UPGRADE_COMMANDS:
+            print(f"Running post-upgrade command: {cmd}")
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print(f"Post-upgrade command executed: {cmd}")
+                print("")
+            except subprocess.CalledProcessError:
+                print(f"Error during post-upgrade command: {cmd}")
+                print("")
+                return
+
+    print_status("Upgrade process completed", "success")
+
+def handle_cleanup(args):
+    colors = Colors()
+
+    if not args.y:
+        confirm = input(f"{colors.BYellow}Remove unused packages. Continue? (y/N) {colors.NC}").strip().lower()
+        if not confirm.startswith('y'):
+            sys.exit(1)
+
+    def cleanup_system_packages():
+        print_status("Cleaning up system packages...")
+        if shutil.which("nala"):
+            cmd = f"sudo nala autoremove{' -y' if args.y else ''}"
+        elif shutil.which("dnf"):
+            cmd = f"sudo dnf autoremove{' -y' if args.y else ''}"
+        elif shutil.which("pacman"):
+            cmd = "sudo pacman -Rns $(pacman -Qtdq) --noconfirm"
+        elif shutil.which("zypper"):
+            cmd = f"sudo zypper autoremove{' -y' if args.y else ''}"
+        else:
+            cmd = f"sudo apt autoremove{' -y' if args.y else ''}"
+
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print_status("System cleanup completed successfully", "success")
+        except subprocess.CalledProcessError:
+            print_status("Error during system cleanup", "error")
+
+    def cleanup_additional_packages():
+        if shutil.which("flatpak"):
+            print_status("Cleaning up Flatpak packages...")
+            cmd = f"sudo flatpak uninstall --unused{' -y' if args.y else ''}"
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print_status("Flatpak cleanup completed successfully", "success")
+            except subprocess.CalledProcessError:
+                print_status("Error during Flatpak cleanup", "error")
+
+        if shutil.which("snap"):
+            print_status("Cleaning up Snap packages...")
+            cmd = "snap list --all | while read snapname ver rev trk pub notes; do if [ \"$notes\" = *disabled* ]; then sudo snap remove \"$snapname\" --revision=\"$rev\"; fi; done"
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print_status("Snap cleanup completed successfully", "success")
+            except subprocess.CalledProcessError:
+                print_status("Error during Snap cleanup", "error")
+
+    print_status("Starting cleanup process...", "info")
+    cleanup_system_packages()
+    cleanup_additional_packages()
+
+    for hook in HOOKS["cleanup-plugin"]:
+        print("")
+        print_status(f"Running plugin: {getattr(hook, '__module__', str(hook))}", "info")
+        hook(args)
+
+    print("")
+    print_status("Cleanup process completed", "success")
+
+def handle_repair(args):
+    colors = Colors()
+
+    if not args.y:
+        confirm = input(f"{colors.BYellow}Repair packages. It will also remove unused packages. Continue? (y/N) {colors.NC}").strip().lower()
+        if not confirm.startswith('y'):
+            sys.exit(1)
+
+    def repair_system_packages():
+        print_status("Repairing system packages...")
+        if shutil.which("nala"):
+            cmd = f"sudo nala install --fix-broken && sudo nala autoremove{' -y' if args.y else ''}"
+        elif shutil.which("dnf"):
+            cmd = f"sudo dnf distro-sync && sudo dnf autoremove{' -y' if args.y else ''}"
+        elif shutil.which("pacman"):
+            cmd = "sudo pacman -Syy && sudo pacman -Rns $(pacman -Qtdq) --noconfirm"
+        elif shutil.which("zypper"):
+            cmd = f"sudo zypper verify{' -y' if args.y else ''}"
+        else:
+            cmd = f"sudo apt install --fix-broken && sudo apt autoremove{' -y' if args.y else ''}"
+
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print_status("System repair completed successfully", "success")
+        except subprocess.CalledProcessError:
+            print_status("Error during system repair", "error")
+
+    def repair_additional_packages():
+        if shutil.which("flatpak"):
+            print_status("Repairing Flatpak packages...")
+            cmd = f"sudo flatpak repair && sudo flatpak uninstall --unused{' -y' if args.y else ''}"
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                print_status("Flatpak repair completed successfully", "success")
+            except subprocess.CalledProcessError:
+                print_status("Error during Flatpak repair", "error")
+
+    print_status("Starting repair process...", "info")
+    repair_system_packages()
+    repair_additional_packages()
+    print_status("Repair process completed", "success")
+
+def handle_list(args):
+    colors = Colors()
+
+    def print_section(title):
+        print(f"\n{colors.BWhite}{title}:{colors.NC}")
+        print(f"{colors.BPurple}{'─' * (len(title) + 1)}{colors.NC}\n")
+
+    def run_command_with_output(cmd):
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            print(f"An error occurred: {e}")
+            return None
+
+    def parse_rpm_ostree_deployments(output):
+        """
+        Parses rpm-ostree status output and returns a list of deployments with their LayeredPackages.
+        Only actual deployments are returned, not State/AutomaticUpdates/etc.
+        """
+        deployments = []
+        current = None
+        in_deployments = False
+        for line in output.splitlines():
+            if line.strip().startswith("Deployments:"):
+                in_deployments = True
+                continue
+            if not in_deployments:
+                continue
+            # New deployment starts with '●' or a non-indented line (but not empty)
+            if line.strip().startswith("●") or (line and not line.startswith(" ")):
+                if current:
+                    deployments.append(current)
+                # Get the deployment title (strip '●' and whitespace)
+                title = line.strip().lstrip("●").strip()
+                # If the title contains ':', try to extract only the image URL part
+                if ':' in title and 'docker://' in title:
+                    # Try to extract just the docker URL
+                    idx = title.find('docker://')
+                    title = title[idx:]
+                current = {
+                    "title": title,
+                    "fields": {},
+                    "LayeredPackages": []
+                }
+            elif current is not None:
+                # Only parse fields for deployments, not for State/AutomaticUpdates
+                if "LayeredPackages:" in line:
+                    pkgs = line.split("LayeredPackages:")[-1].strip()
+                    if pkgs:
+                        current["LayeredPackages"] = pkgs.split()
+                elif ":" in line:
+                    key, val = line.split(":", 1)
+                    current["fields"][key.strip()] = val.strip()
+        if current:
+            deployments.append(current)
+        return deployments
+    
+    if args.plugin:
+        print_section("Better-pkg plugins")
+
+        plugins_dir = os.path.expanduser("~/.local/share/better-tools/plugins/")
+        if not os.path.isdir(plugins_dir):
+            print_status("No plugins directory found.", "warning")
+            return
+        plugins = [f for f in os.listdir(plugins_dir) if f.endswith(".py") and not f.startswith("_")]
+        if not plugins:
+            print_status("No plugins installed.", "warning")
+        else:
+            for plugin in plugins:
+                plugin_name = plugin[:-3] if plugin.endswith(".py") else plugin
+                print(f"{colors.BGreen}  • {plugin_name}{colors.NC}")
+        print("")
+        return
+    
+    if not args.json:
+        print_status("Scanning installed packages...", "info")
+
+    # Detect if rpm-ostree is present and active
+    is_rpm_ostree = shutil.which("rpm-ostree") is not None and (
+        run_command_with_output("rpm-ostree status") or ""
+    ).find("Deployments:") != -1
+
+    package_managers = {
+        "System Packages": {
+            "pacman": {
+                "all": "pacman -Q",
+                "user": "pacman -Qe",
+                "outdated": "pacman -Qu",
+                "orphans": "pacman -Qdtq",
+                "unused": "pacman -Qdtq"
+            },
+            "apt": {
+                "all": "dpkg-query -W --showformat='${Package}\n'",
+                "user": "apt-mark showmanual",
+                "outdated": "apt list --upgradable",
+                "orphans": "apt autoremove --dry-run",
+                "unused": "deborphan"
+            },
+            "dnf": {
+                "all": "dnf list installed",
+                "user": "dnf history userinstalled",
+                "outdated": "dnf check-update",
+                "orphans": "dnf repoquery --extras",
+                "unused": "dnf repoquery --extras"
+            },
+            "zypper": {
+                "all": "zypper se --installed-only",
+                "user": "zypper packages --user-installed",
+                "outdated": "zypper list-updates",
+                "orphans": "zypper se --unneeded",
+                "unused": "zypper se --unneeded"
+            },
+            "rpm-ostree": {
+                "all": "rpm-ostree status",
+                "user": "rpm-ostree status",  # rpm-ostree does not distinguish user/system
+                "outdated": "rpm-ostree upgrade --check",
+                "orphans": None,
+                "unused": None
+            }
+        },
+        "Additional Package Managers": {
+            "flatpak": {
+                "all": "flatpak list",
+                "user": "flatpak list --app",
+                "outdated": "flatpak update --list",
+                "orphans": "flatpak uninstall --unused",
+                "unused": "flatpak uninstall --unused"
+            },
+            "snap": {
+                "all": "snap list",
+                "user": "snap list --all",
+                "outdated": "snap refresh --list",
+                "orphans": "snap list --all --unaliased --no-aliases",
+                "unused": "snap list --all --unaliased --no-aliases"
+            },
+            "pacstall": {
+                "all": "pacstall -l",
+                "user": "pacstall -l",
+                "outdated": None,
+                "orphans": None,
+                "unused": None
+            },
+            "brew": {
+                "all": "brew list",
+                "user": "brew leaves",
+                "outdated": "brew outdated",
+                "orphans": "brew list --orphan",
+                "unused": "brew list --orphan"
+            }
+        }
+    }
+
+    total_packages = 0
+
+    mode = "outdated"
+    if args.outdated:
+        mode = "outdated"
+    elif args.unused:
+        mode = "orphans"
+    elif args.user:
+        mode = "user"
+    else:
+        mode = "all"
+
+    mode_text = "outdated"
+    if args.outdated:
+        mode_text = "outdated"
+    elif args.unused:
+        mode_text = "orphans"
+    elif args.user:
+        mode_text = "user"
+    else:
+        mode_text = "installed"
+
+    json_output = [] if args.json else None
+
+    if args.repo:
+        repo_name = args.repo if isinstance(args.repo, str) else args.repo[0]
+
+        if not args.json:
+            print_section(f"Packages from repository: {repo_name}")
+
+        found = False
+        for pm in ["pacman", "apt", "dnf", "zypper", "rpm-ostree"]:
+            if not shutil.which(pm):
+                continue
+            if pm == "rpm-ostree":
+                print_status("Filtering by repository is not supported for rpm-ostree and will not be supported.", "warning")
+                continue
+            if pm == "pacman":
+                print_status("Better-pkg dont support filtering packages by repository in pacman. I am working on it!", "warning")
+                return
+            repo_cmds = {
+                "apt": f"apt-cache policy | grep {repo_name}",
+                "dnf": f"dnf list installed | grep @{repo_name}",
+                "zypper": f"zypper se --installed-only | grep {repo_name}"
+            }
+            output = run_command_with_output(repo_cmds.get(pm, ""))
+            if output:
+                print(output)
+                found = True
+            else:
+                print_status(f"No packages found from repository {repo_name}", "warning")
+
+        if not found and not args.json:
+            print_status(f"Repository {repo_name} not found or is not configured correctly.", "error")
+
+    else:
+        for section, managers in package_managers.items():
+            found = False
+            for pm, cmds in managers.items():
+                # If rpm-ostree is present, skip dnf (to avoid confusion)
+                if is_rpm_ostree and pm == "dnf":
+                    continue
+                if not shutil.which(pm):
+                    continue
+                if pm == "rpm-ostree":
+                    # Only show rpm-ostree output, skip others if rpm-ostree is active
+                    if not args.json:
+                        print_section(f"{section} - rpm-ostree Deployments")
+                    output = run_command_with_output(cmds[mode if mode in cmds else "all"])
+                    if output:
+                        deployments = parse_rpm_ostree_deployments(output)
+                        for i, dep in enumerate(deployments):
+                            # Only show deployments, skip State/AutomaticUpdates etc.
+                            # The first deployment is always the active one (●)
+                            active = (i == 0)
+                            title = dep["title"]
+                            if not args.json:
+                                print(f"{colors.BCyan}{'[ACTIVE]' if active else '[OLD]'} {title}{colors.NC}")
+                                if dep["LayeredPackages"]:
+                                    for pkg in dep["LayeredPackages"]:
+                                        print(f"{colors.BGreen}{pkg}{colors.NC}")
+                                else:
+                                    print(f"{colors.BYellow}No layered packages.{colors.NC}")
+                                print()
+                            else:
+                                json_output.append({
+                                    "deployment": title,
+                                    "active": active,
+                                    "fields": dep["fields"],
+                                    "layered_packages": dep["LayeredPackages"]
+                                })
+                                total_packages += len(dep["LayeredPackages"])
+                        found = True
+                    else:
+                        if not args.json:
+                            print_status("No rpm-ostree deployments found.", "warning")
+                    # If rpm-ostree is present, do not show other system package managers
+                    break
+                if mode in cmds and cmds[mode]:
+                    if not args.json:
+                        print_section(f"{section} - {pm.capitalize()} Packages")
+                    output = run_command_with_output(cmds[mode])
+                    if output:
+                        count = len(output.split('\n'))
+                        total_packages += count
+                        if args.json:
+                            json_output.append({
+                                "manager": pm,
+                                "packages": output.split("\n"),
+                                "count": count
+                            })
+                        else:
+                            print(f"{colors.BCyan}Found {count} {mode_text} packages from {pm}{colors.NC}\n")
+                            print(output)
+                        found = True
+            if not found and not args.json:
+                print_status(f"No {mode_text} packages found for {section}", "warning")
+
+    if args.json:
+        print(json.dumps({"total_packages": total_packages, "packages": json_output}, indent=4))
+    else:
+        print(f"\n{colors.BWhite}Summary:{colors.NC}")
+        print(f"{colors.BGreen}Total {mode_text} packages: {total_packages}{colors.NC}")
+
+def handle_cache(args):
+    colors = Colors()
+
+    """Removes cache for package managers."""
+    package_managers = {
+        "apt": "sudo apt-get clean && sudo apt-get autoclean",
+        "dnf": "sudo dnf clean all",
+        "pacman": "sudo pacman -Scc --noconfirm",
+        "zypper": "sudo zypper clean",
+        "yay": "yay -Sc --noconfirm",
+        "paru": "yay -Sc --noconfirm",
+        "flatpak": "flatpak uninstall --unused -y",
+        "snap": "sudo snap set system refresh.retain=2 && sudo snap refresh --list && sudo snap remove $(snap list | awk '/^disabled/{print $1}')"
+    }
+
+    if not args.y:
+        confirm = input(f"{colors.BYellow}This will removeckage caches. Continue? (y/N) {colors.NC}").strip().lower()
+        if not confirm.startswith('y'):
+            sys.exit(1)
+
+    # Vymazání cache pro každého správce balíčků
+    for manager, command in package_managers.items():
+        if shutil.which(manager):
+            print(f"Removing cache for {manager}...")
+            run_command(command)
+            print(f"Cache for {manager} was successfully removed.")
+
+# system setup
+def install_packages(packages, flatpak_packages=None):
+        # Získání aktuálního package manageru
+        current_pm = None
+        if shutil.which("apt"):
+            current_pm = "apt"
+        elif shutil.which("dnf"):
+            current_pm = "dnf"
+        elif shutil.which("pacman"):
+            current_pm = "pacman"
+        elif shutil.which("yay"):
+            current_pm = "yay"
+        else:
+            print("No supported package manager found.")
+            return
+        
+        # Seskupení balíčků podle package manageru
+        package_groups = {}
+
+        # Filtrace balíčků podle aktuálního package manageru
+        for pkg, repos in packages.items():
+            if current_pm in repos:
+                if current_pm not in package_groups:
+                    package_groups[current_pm] = []
+                package_groups[current_pm].append(pkg)
+
+        # Instalace balíčků po skupinách
+        for repo, pkgs in package_groups.items():
+            install_package(pkgs, repo)
+
+        # Instalace flatpak balíčků, pokud je detekován Flatpak
+        if flatpak_packages and shutil.which("flatpak"):
+            flatpak_pkgs = list(flatpak_packages.keys())
+            install_package(flatpak_pkgs, "flatpak")
+        
+def handle_setup(args):
+    """Manages software package installation based on system settings."""
+    global SETUP_FUNCTIONS
+    installed_packages = []  # Track installed packages globally
+    colors = Colors()
+
+    if args.list_options:
+        print(f"\n{colors.BWhite}Available setup options:{colors.NC}")
+        print(f"{colors.BPurple}{'─' * (len('Available setup options:') + 1)}{colors.NC}\n")
+        options = set(SETUP_FUNCTIONS.keys()).union([
+            "gaming", "samba", "printers", "codecs", "developer", "recommended", "chrome", "btrfs", "homebrew", "security", "virtualization", "distrobox", "backup"
+        ])
+        for option in options:
+            print(option)
+        sys.exit(0)
+
+    def get_package_groups():
+        base = {
+            "gaming": {
+                "packages": {
+                    "steam": ["apt", "dnf", "pacman", "yay"],
+                    "lutris": ["apt", "dnf", "pacman", "yay"],
+                    "heroic-games-launcher": ["dnf", "pacman", "yay"],
+                    "winetricks": ["apt", "dnf", "pacman", "yay"],
+                    "gamemode": ["apt", "dnf", "pacman", "yay"],
+                    "goverlay": ["dnf", "pacman", "yay"],
+                    "obs-studio": ["apt", "dnf", "pacman", "yay"],
+                    "mangohud": ["apt", "dnf", "pacman", "yay"],
+                    "piper": ["apt", "dnf", "pacman", "yay"],
+                    "corectrl": ["dnf", "pacman", "yay"],
+                },
+                "flatpak": {
+                    "com.usebottles.bottles": "flatpak",
+                    "com.discordapp.Discord": "flatpak",
+                    "org.prismlauncher.PrismLauncher": "flatpak"
+                }
+            },
+            "samba": {
+                "packages": {
+                    "samba": ["apt", "dnf", "pacman", "yay"],
+                    "smbclient": ["apt", "dnf", "pacman", "yay"],
+                    "cifs-utils": ["apt", "dnf", "pacman", "yay"]
+                }
+            },
+            "printers": {
+                "packages": {
+                    "cups": ["apt", "dnf", "pacman", "yay"],
+                    "cups-pdf": ["apt", "dnf", "pacman", "yay"],
+                    "system-config-printer": ["apt", "dnf", "pacman", "yay"],
+                    "hplip": ["apt", "dnf", "pacman", "yay"],
+                    "sane": ["apt", "dnf", "pacman", "yay"],
+                    "sane-airscan": ["apt", "dnf", "pacman", "yay"],
+                    "ipp-usb": ["apt", "dnf", "pacman", "yay"]
+                },
+                "post_install": lambda: run_command("sudo systemctl enable --now cups")
+            },
+            "codecs": {
+                "packages": {
+                    "ffmpeg": ["apt", "dnf", "pacman", "yay"],
+                    "gstreamer": ["apt", "dnf", "pacman", "yay"],
+                    "gstreamer-plugins-good": ["apt", "dnf"],
+                    "gstreamer-plugins-bad": ["apt", "dnf"],
+                    "gstreamer-plugins-ugly": ["apt", "dnf"],
+                    "gstreamer-libav": ["apt", "dnf"],
+                    "libdvdcss": ["apt", "dnf", "pacman", "yay"],
+                    "lame": ["apt", "dnf", "pacman", "yay"],
+                    "x264": ["apt", "dnf", "pacman", "yay"],
+                    "x265": ["apt", "dnf", "pacman", "yay"],
+                    "libavcodec-extra": ["apt"],
+                    "fluidsynth": ["apt", "dnf", "pacman", "yay"],
+                    "faac": ["apt", "dnf", "pacman", "yay"],
+                    "faad": ["apt", "dnf", "pacman", "yay"]
+                }
+            },
+            "developer": {
+                "packages": {
+                    "git": ["apt", "dnf", "pacman", "yay"],
+                    "vim": ["apt", "dnf", "pacman", "yay"],
+                    "build-essential": ["apt", "dnf", "pacman", "yay"],
+                    "python3": ["apt", "dnf", "pacman", "yay"],
+                    "nodejs": ["apt", "dnf", "pacman", "yay"],
+                    "npm": ["apt", "dnf", "pacman", "yay"],
+                    "docker": ["apt", "dnf", "pacman", "yay"],
+                    "docker-compose": ["apt", "dnf", "pacman", "yay"]
+                },
+                "flatpak": {
+                    "com.visualstudio.code": "flatpak",
+                    "dev.zed.Zed": "flatpak"
+                }
+            },
+            "security": {
+                "packages": {
+                    "ufw": ["apt", "dnf", "pacman", "yay"],
+                    "apparmor": ["pacman"]
+                },
+                "post_install": lambda: setup_security_services(installed_packages)
+            },
+            "virtualization": {
+                "packages": {
+                    "virtualbox": ["apt", "dnf", "pacman", "yay"],
+                    "docker": ["apt", "dnf", "pacman", "yay"],
+                    "qemu": ["apt", "dnf", "pacman", "yay"],
+                    "libvirt-bin": ["apt", "dnf", "pacman", "yay"],
+                    "lxc": ["apt", "dnf", "pacman", "yay"]
+                }
+            },
+            "distrobox": {
+                "packages": {
+                    "podman": ["apt", "dnf", "pacman", "yay"],
+                    "distrobox": ["apt", "dnf", "pacman", "yay"],
+                },
+                "flatpak": {
+                    "app.devsuite.Ptyxis": "flatpak",
+                    "io.github.dvlv.boxbuddyrs": "flatpak"
+                }
+            },
+            "backup": {
+                "packages": {
+                    "rsync": ["apt", "dnf", "pacman", "yay"],
+                    "duplicity": ["apt", "dnf", "pacman", "yay"],
+                    "timeshift": ["apt", "dnf", "pacman", "yay"],
+                    "rclone": ["apt", "dnf", "pacman", "yay"],
+                    "restic": ["apt", "dnf", "pacman", "yay"]
+                },
+                "flatpak": {
+                    "org.gnome.World.PikaBackup": "flatpak"
+                },
+                "post_install": lambda: setup_backup()
+            },
+        }
+        for extender in PACKAGE_GROUPS_EXTENSIONS:
+            extender(base)
+        return base
+
+    def setup_security_services(installed_packages):
+            """Configure security services after installation"""
+            if shutil.which("pacman") and "apparmor" in installed_packages:
+                print("Setting up AppArmor...")
+                run_command("sudo systemctl enable --now apparmor")
+    
+            if "ufw" in installed_packages:
+                print("Setting up UFW...")
+                run_command("sudo ufw enable")
+
+    def setup_backup():
+        run_command("sudo systemctl enable --now timeshift.service")
+        print("Timeshift has been successfully enabled, but we recommend to restart the system.")
+
+    def setup_chrome():
+        """Install Google Chrome on Debian-based systems"""
+        if not shutil.which("apt"):
+            print("This function only works on Ubuntu and Debian.")
+            return
+
+        url = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+        deb_file = "/tmp/google-chrome.deb"
+
+        print("Downloading Google Chrome...")
+        subprocess.run(["wget", "-O", deb_file, url], check=True)
+
+        print("Installing Google Chrome...")
+        subprocess.run(["sudo", "dpkg", "-i", deb_file], check=True)
+        subprocess.run(["sudo", "apt", "-f", "install", "-y"], check=True)
+
+        os.remove(deb_file)
+        print("Google Chrome has been successfully installed!")
+
+    def setup_recommended():
+        """Install recommended packages based on system configuration"""
+        def get_fedora_version():
+            try:
+                result = subprocess.run("rpm -E %fedora", shell=True, check=True, capture_output=True, text=True)
+                return int(result.stdout.strip())
+            except (subprocess.CalledProcessError, ValueError):
+                return None
+
+        def detect_desktop():
+            """Detekuje aktuální desktopové prostředí."""
+            desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+
+            if not desktop:
+                # Alternativní kontrola pro některé DE
+                if os.environ.get("GNOME_DESKTOP_SESSION_ID"):
+                    return "gnome"
+                elif os.environ.get("KDE_FULL_SESSION"):
+                    return "kde"
+                elif os.environ.get("DESKTOP_SESSION"):
+                    return os.environ["DESKTOP_SESSION"].lower()
+
+            # Normalizace některých názvů
+            if "gnome" in desktop:
+                return "gnome"
+            elif "kde" in desktop:
+                return "kde"
+            elif "xfce" in desktop:
+                return "xfce"
+            elif "lxqt" in desktop:
+                return "lxqt"
+            elif "cinnamon" in desktop:
+                return "cinnamon"
+            elif "mate" in desktop:
+                return "mate"
+            elif "budgie" in desktop:
+                return "budgie"
+            elif "deepin" in desktop:
+                return "deepin"
+            elif "pantheon" in desktop:
+                return "pantheon"
+            elif "sway" in desktop or "hyprland" in desktop:
+                return "wayland-wm"
+
+            return "unknown"
+
+        packages = {
+            "libreoffice": ["apt", "dnf", "pacman", "yay"],
+            "gnome-software": ["apt", "dnf", "pacman", "yay"],
+            "fastfetch": ["dnf", "pacman", "yay"],
+            "htop": ["apt", "dnf", "pacman", "yay"],
+            "kvantum-qt5": ["dnf", "pacman", "yay"],
+            "kvantum-qt6": ["dnf", "yay"],
+            "vlc": ["apt", "dnf", "pacman", "yay"],
+            "flatpak": ["apt", "dnf", "pacman", "yay"],
+            "flameshot": ["apt", "dnf", "pacman", "yay"],
+            "nala": ["apt"]
+        }
+
+        desktop_packages = {
+            "gnome": ["gnome-tweaks", "gnome-shell-extensions", "lollypop", "dconf-editor"],
+            "kde": ["elisa"],
+            "xfce": ["xfce4-goodies"],
+            "lxqt": ["lxqt-config", "pcmanfm-qt", "lxqt-archiver"],
+            "cinnamon": ["gnome-terminal"],
+            "mate": ["mate-extra"],
+            "budgie": ["gnome-terminal"],
+            "deepin": ["deepin-extra"],
+            "pantheon": ["elementary-tweaks"],
+            "wayland-wm": ["sway", "waybar", "alacritty"]
+        }
+
+        arch_packages = {
+            # Základní
+            "firefox": ["pacman", "yay"],
+            "base-devel": ["pacman", "yay"],
+            "pacman-contrib": ["pacman", "yay"],
+            "reflector": ["pacman", "yay"],
+            "man-db": ["pacman", "yay"],
+            "man-pages": ["pacman", "yay"],
+
+            # Bluetooth
+            "bluez": ["pacman", "yay"],
+            "bluez-utils": ["pacman", "yay"],
+            "bluez-deprecated-tools": ["pacman", "yay"],
+            }
+
+        # GPU drivers podle distribuce
+        gpu_drivers = {
+            'apt': {
+                'nvidia': ['nvidia-driver-535', 'nvidia-settings'],
+                'amd': ['xserver-xorg-video-amdgpu', 'mesa-vulkan-drivers'],
+                'intel': ['xserver-xorg-video-intel', 'intel-media-va-driver']
+            },
+            'dnf': {
+                'nvidia': ['akmod-nvidia', 'xorg-x11-drv-nvidia'],
+                'amd': ['mesa-vulkan-drivers', 'xorg-x11-drv-amdgpu'],
+                'intel': ['mesa-vulkan-drivers', 'libva-intel-driver']
+            },
+            'pacman': {
+                'nvidia': ['nvidia', 'nvidia-utils'],
+                'amd': ['xf86-video-amdgpu', 'mesa', 'vulkan-radeon'],
+                'intel': ['xf86-video-intel', 'mesa', 'vulkan-intel']
+            }
+        }
+
+        if shutil.which("dnf"):
+            fedora_version = get_fedora_version()
+            if not fedora_version:
+                print("Error while detecting version of Fedora, please, set up rpmfusion by yourself.")
+                return
+
+            print("Enabling RPM Fusion...")
+            run_command(f"sudo dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-{fedora_version}.noarch.rpm "
+                        f"https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-{fedora_version}.noarch.rpm")
+
+            if fedora_version >= 41:
+                print("Enabling fedora-cisco-openh264...")
+                run_command("sudo dnf config-manager setopt fedora-cisco-openh264.enabled=1")
+                run_command("sudo dnf config-manager --enable fedora-cisco-openh264")
+
+        install_packages(packages)
+
+        if shutil.which("pacman"):
+            install_packages(arch_packages)
+
+        desktop = detect_desktop()
+        if desktop in desktop_packages:
+            print(f"Installing packages for {desktop} desktop environment...")
+            for pkg in desktop_packages[desktop]:
+                install_package(pkg, "pacman" if shutil.which("pacman") else "apt" if shutil.which("apt") else "dnf")
+
+        if shutil.which("flatpak"):
+                run_command("flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo")
+                print("Flathub was added.")
+        else:
+            print("Something went wrong, Flatpak is not installed so I cannot add Flathub.")
+
+        if shutil.which("flatpak"):
+            install_package("org.gnome.World.PikaBackup", "flatpak")
+            install_package("com.github.tchx84.Flatseal", "flatpak")
+            if os.path.exists("/usr/bin/gnome-shell"):
+                install_package("com.mattjakeman.ExtensionManager", "flatpak")
+
+        # Detekce a instalace ovladačů
+        try:
+            gpu_info = subprocess.check_output(['lspci'], text=True).lower()
+
+            # Zjištění package manageru
+            pm = None
+            if shutil.which('apt'): pm = 'apt'
+            elif shutil.which('dnf'): pm = 'dnf'
+            elif shutil.which('pacman'): pm = 'pacman'
+
+            if pm:
+                # Handle multiple GPUs
+                if 'nvidia' in gpu_info:
+                    print("\nDetected NVIDIA GPU. Installing NVIDIA drivers...")
+                    for pkg in gpu_drivers[pm]['nvidia']:
+                        install_package(pkg, pm)
+
+                if any(x in gpu_info for x in ['amd', 'ati']):
+                    print("\nDetected AMD GPU. Installing AMD drivers...")
+                    for pkg in gpu_drivers[pm]['amd']:
+                        install_package(pkg, pm)
+
+                if 'intel' in gpu_info:
+                    print("\nDetected Intel GPU. Installing Intel drivers...")
+                    for pkg in gpu_drivers[pm]['intel']:
+                        install_package(pkg, pm)
+                    print("\nInstalling NVIDIA drivers...")
+                    for pkg in gpu_drivers[pm]['nvidia']:
+                        install_package(pkg, pm)
+
+                if any(x in gpu_info for x in ['amd', 'ati']):
+                    print("\nInstalling AMD drivers...")
+                    for pkg in gpu_drivers[pm]['amd']:
+                        install_package(pkg, pm)
+
+                if 'intel' in gpu_info:
+                    print("\nInstalling Intel drivers...")
+                    for pkg in gpu_drivers[pm]['intel']:
+                        install_package(pkg, pm)
+
+                # Instalace obecných grafických balíčků
+                print("\nInstalling general graphics packages...")
+                install_package('mesa-utils', pm)
+                install_package('vulkan-tools', pm)
+
+        except Exception as e:
+            print(f"\nError during driver detection/installation: {e}")
+
+        print("")
+        user_input = input("Do you want to install additional codecs and drivers? (Y/N): ").strip().lower()
+
+        if user_input == "y":
+            print("Installing additional codecs and drivers...")
+
+            # Run the setup commands for printers, samba, and codecs
+            try:
+                subprocess.run(["better-pkg", "setup", "printers", "-y"], check=True)
+                subprocess.run(["better-pkg", "setup", "samba", "-y"], check=True)
+                subprocess.run(["better-pkg", "setup", "codecs", "-y"], check=True)
+                print("Additional codecs and drivers have been installed successfully.")
+            except subprocess.CalledProcessError as e:
+                print(f"Error occurred: {e}")
+        else:
+            print("No additional codecs and drivers will be installed.")
+
+        print("\nRecommended packages and drivers installation completed!")
+        print("Note: A system restart may be required for the drivers to take effect.")
+
+    def setup_btrfs():
+        """Setup Btrfs snapshots with btrfs-grub."""
+
+        # Embedded check_btrfs_system function
+        def check_btrfs_system() -> bool:
+            """Check if system uses Btrfs."""
+            try:
+                result = subprocess.run(['df', '-T', '/'], capture_output=True, text=True)
+                return "btrfs" in result.stdout.lower()
+            except subprocess.CalledProcessError:
+                return False
+
+        # Embedded setup_snapper_configs function
+        def setup_snapper_configs() -> bool:
+            """Setup snapper configuration."""
+            configs = {
+                "root": "/",
+            }
+
+            success = True
+            for config_name, path in configs.items():
+                if os.path.exists(path):
+                    print(f"\nSetting up snapper for {path}...")
+                    try:
+                        subprocess.run(['sudo', 'snapper', '-c', config_name, 'create-config', path], check=True)
+                    except subprocess.CalledProcessError:
+                        print(f"Error creating configuration for {path}")
+                        success = False
+
+            return success
+
+        # Check if system uses Btrfs
+        if not check_btrfs_system():
+            print("[red]❌ This system does not use Btrfs filesystem![/red]")
+            return False
+
+        warning = (
+            "⚠️ Setting up Btrfs snapshots. Proceed only if you have Btrfs and Grub installed! Do you want to continue? (y/N): "
+        )
+        if input(warning).strip().lower() != 'y':
+            print("Btrfs snapshots installation was cancelled.")
+            return False
+
+        # Package definitions and their availability in different repositories
+        packages: Dict[str, List[str]] = {
+            "btrfs-progs": ["apt", "dnf", "pacman", "yay"],
+            "snapper": ["apt", "dnf", "pacman", "yay"],
+            "grub-btrfs": ["pacman", "yay"],
+            "btrfs-assistant": ["dnf", "yay"]
+        }
+
+        # Package installation
+        installed_pkgs = []
+        for pkg, repos in packages.items():
+            installed = False
+            for repo in repos:
+                if shutil.which(repo) and install_package(pkg, repo):
+                    installed_pkgs.append(pkg)
+                    installed = True
+                    break
+            if not installed:
+                print(f"[yellow]⚠️ Failed to install package {pkg}[/yellow]")
+
+        # Setting up snapper configurations
+        if "snapper" in installed_pkgs:
+            if not setup_snapper_configs():
+                print("[yellow]⚠️ Some snapper configurations failed to create[/yellow]")
+
+        # Enable and start services
+        if "grub-btrfs" in installed_pkgs:
+            print("\n[cyan]Activating grub-btrfsd service...[/cyan]")
+            try:
+                subprocess.run(['sudo', 'systemctl', 'enable', '--now', 'grub-btrfsd'], check=True)
+            except subprocess.CalledProcessError:
+                print("[red]Error activating grub-btrfsd service[/red]")
+
+        # Create first snapshot
+        print("\n[cyan]Creating initial snapshot...[/cyan]")
+        try:
+            subprocess.run(['sudo', 'snapper', '-c', 'root', 'create', '-d', 'Initial snapshot'], check=True)
+        except subprocess.CalledProcessError:
+            print("[red]Error creating initial snapshot[/red]")
+
+        print("\n[green]✅ Btrfs snapshots setup completed.[/green]")
+
+    def setup_brew():
+        """
+        Installs and configures Homebrew.
+        """
+        try:
+            # Check if Homebrew is already installed
+            result = subprocess.run(['which', 'brew'], capture_output=True, text=True)
+            if result.returncode == 0:
+                print("Homebrew is already installed")
+                return True
+
+            print("Installing Homebrew...")
+
+            # Install Homebrew
+            install_command = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+            process = subprocess.run(install_command, shell=True, executable='/bin/bash')
+
+            if process.returncode != 0:
+                print("Error during Homebrew installation")
+                return False
+
+            # Setup Homebrew
+            commands = [
+                'test -d ~/.linuxbrew && eval "$(~/.linuxbrew/bin/brew shellenv)"',
+                'test -d /home/linuxbrew/.linuxbrew && eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"'
+            ]
+
+            # Execute setup commands
+            for cmd in commands:
+                subprocess.run(cmd, shell=True, executable='/bin/bash')
+
+            # Get brew prefix
+            try:
+                brew_prefix = subprocess.run(['brew', '--prefix'],
+                                           capture_output=True,
+                                           text=True).stdout.strip()
+
+                # Add to .bashrc if not already present
+                bashrc_path = os.path.expanduser('~/.bashrc')
+                brew_init_line = f'eval "$({brew_prefix}/bin/brew shellenv)"'
+
+                if os.path.exists(bashrc_path):
+                    with open(bashrc_path, 'r') as f:
+                        content = f.read()
+
+                    if 'brew shellenv' not in content:
+                        with open(bashrc_path, 'a') as f:
+                            f.write(f'\n{brew_init_line}\n')
+
+                print("Homebrew was successfully installed and configured")
+                return True
+
+            except Exception as e:
+                print(f"Error during Homebrew configuration: {str(e)}")
+                return False
+
+        except Exception as e:
+            print(f"Error during Homebrew installation: {str(e)}")
+            return False
+
+    # Map setup functions
+    SETUP_FUNCTIONS.update({
+        "gaming": lambda: install_packages(get_package_groups()["gaming"]["packages"],
+                                         get_package_groups()["gaming"]["flatpak"]),
+        "samba": lambda: install_packages(get_package_groups()["samba"]["packages"]),
+        "printers": lambda: install_packages(get_package_groups()["printers"]["packages"]),
+        "codecs": lambda: install_packages(get_package_groups()["codecs"]["packages"]),
+        "recommended": setup_recommended,
+        "chrome": setup_chrome,
+        "btrfs": setup_btrfs,
+        "homebrew": setup_brew,
+        "developer": lambda: install_packages(get_package_groups()["developer"]["packages"],
+                                            get_package_groups()["developer"]["flatpak"]),
+        "security": lambda: install_packages(get_package_groups()["security"]["packages"]),
+        "virtualization": lambda: install_packages(get_package_groups()["virtualization"]["packages"]),
+        "distrobox": lambda: install_packages(get_package_groups()["distrobox"]["packages"], get_package_groups()["distrobox"]["flatpak"]),
+        "backup": lambda: install_packages(get_package_groups()["backup"]["packages"], get_package_groups()["backup"]["flatpak"])
+    })
+
+    # Handle user confirmation
+    if not args.y:
+        confirm = input("This will install packages and configure your system. Are you sure you want to proceed? (y/N) ").strip().lower()
+        if not confirm.startswith('y'):
+            sys.exit(1)
+
+    # Execute requested setup
+    if args.setup[0] in SETUP_FUNCTIONS:
+        SETUP_FUNCTIONS[args.setup[0]]()
+    else:
+        print(f"Unknown argument: {args.setup[0]}")
+
+def setup_custom(args):
+    """Setup custom packages from a configuration file."""
+
+    if not args.y:
+        confirm = input("This will install packages from the configuration file. Are you sure? (y/N) ").strip().lower()
+        if not confirm.startswith('y'):
+            return
+
+    try:
+        with open(args.config_file, 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{args.config_file}' not found")
+        return
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON in configuration file '{args.config_file}'")
+        return
+
+    if not isinstance(config, dict):
+        print("Error: Invalid configuration file format")
+        return
+
+    packages = config.get("packages", {})
+    flatpak_packages = config.get("flatpak", {})
+    brew_packages = config.get("brew", {})  # Přidáno pro Homebrew
+
+    installed_packages = []
+
+    # Seskupení balíčků podle package manageru
+    package_groups = {}
+    for pkg, repos in packages.items():
+        for repo in repos:
+            if shutil.which(repo):
+                if repo not in package_groups:
+                    package_groups[repo] = []
+                package_groups[repo].append(pkg)
+                break
+
+    # Instalace balíčků po skupinách
+    for repo, pkgs in package_groups.items():
+        install_package(pkgs, repo)
+        installed_packages.extend([f"{pkg} ({repo})" for pkg in pkgs])
+
+    # Instalace flatpak balíčků
+    if flatpak_packages and shutil.which("flatpak"):
+        flatpak_pkgs = list(flatpak_packages.keys())
+        install_package(flatpak_pkgs, "flatpak")
+        installed_packages.extend([f"{pkg} (flatpak)" for pkg in flatpak_pkgs])
+
+    # Instalace Homebrew balíčků
+    if brew_packages and shutil.which("brew"):
+        brew_pkgs = list(brew_packages.keys())
+        install_package(brew_pkgs, "brew")
+        installed_packages.extend([f"{pkg} (brew)" for pkg in brew_pkgs])
+
+    for key, handler in CUSTOM_JSON_HANDLERS.items():
+        if key in config:
+            print("")
+            print_status(f"Processing custom handler for: {key}", "info")
+            handler(config[key])
+
+    if installed_packages:
+        print("\nInstalled packages:")
+        for pkg in installed_packages:
+            print(f" - {pkg}")
+    else:
+        print("No packages were installed")
+
+def setup_remove(args):
+    """Remove custom packages from a configuration file."""
+
+    if not args.y:
+        confirm = input("This will remove packages from the configuration file. Are you sure? (y/N) ").strip().lower()
+        if not confirm.startswith('y'):
+            return
+
+    try:
+        with open(args.config_file, 'r') as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Configuration file '{args.config_file}' not found")
+        return
+    except json.JSONDecodeError:
+        print(f"Error: Invalid JSON in configuration file '{args.config_file}'")
+        return
+
+    if not isinstance(config, dict):
+        print("Error: Invalid configuration file format")
+        return
+
+    packages = config.get("packages", {})
+    flatpak_packages = config.get("flatpak", {})
+    brew_packages = config.get("brew", {})  # Přidáno pro Homebrew
+
+    installed_packages = []
+
+    # Seskupení balíčků podle package manageru
+    package_groups = {}
+    for pkg, repos in packages.items():
+        for repo in repos:
+            if shutil.which(repo):
+                if repo not in package_groups:
+                    package_groups[repo] = []
+                package_groups[repo].append(pkg)
+                break
+
+    # Instalace balíčků po skupinách
+    for repo, pkgs in package_groups.items():
+        remove_package(pkgs, repo)
+        installed_packages.extend([f"{pkg} ({repo})" for pkg in pkgs])
+
+    # Instalace flatpak balíčků
+    if flatpak_packages and shutil.which("flatpak"):
+        flatpak_pkgs = list(flatpak_packages.keys())
+        remove_package(flatpak_pkgs, "flatpak")
+        installed_packages.extend([f"{pkg} (flatpak)" for pkg in flatpak_pkgs])
+
+    # Instalace Homebrew balíčků
+    if brew_packages and shutil.which("brew"):
+        brew_pkgs = list(brew_packages.keys())
+        remove_package(brew_pkgs, "brew")
+        installed_packages.extend([f"{pkg} (brew)" for pkg in brew_pkgs])
+
+    if installed_packages:
+        print("\nRemoved packages:")
+        for pkg in installed_packages:
+            print(f" - {pkg}")
+    else:
+        print("No packages were installed")
+
+def setup_export(args):
+    """
+    Exportuje vybrané balíčky do konfiguračního souboru.
+    """
+    import glob
+    import configparser
+    from time import sleep
+
+    colors = Colors()
+    config = {
+        "packages": {},
+        "flatpak": {},
+        "brew": {},
+        "zypper": {}
+    }
+
+    def print_category(category):
+        """Barevný výpis kategorie"""
+        print(f"{colors.BPurple}  • {category}{colors.NC}")
+
+    def get_desktop_files_categories():
+        """
+        Získá mapování aplikací do kategorií z .desktop souborů
+        """
+        print_status("Scanning desktop files...", "info")
+
+        categories_map = {}
+        desktop_paths = [
+            "/usr/share/applications/*.desktop",
+            "/usr/local/share/applications/*.desktop",
+            "~/.local/share/applications/*.desktop",
+            "/var/lib/flatpak/app/*/current/active/files/share/applications/*.desktop"
+        ]
+
+        for path in desktop_paths:
+            for desktop_file in glob.glob(os.path.expanduser(path)):
+                try:
+                    # Načteme soubor ručně a nahradíme problematické znaky
+                    with open(desktop_file, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Nahradíme %U, %F, %f, %u prázdným řetězcem
+                    content = content.replace('%U', '').replace('%F', '').replace('%f', '').replace('%u', '')
+
+                    parser = configparser.ConfigParser()
+                    parser.read_string(content)
+
+                    if 'Desktop Entry' in parser:
+                        entry = parser['Desktop Entry']
+                        if 'Categories' in entry:
+                            # Získání názvu balíčku
+                            package_name = None
+
+                            # Pro Flatpak aplikace
+                            if 'flatpak' in desktop_file:
+                                if 'X-Flatpak' in entry:
+                                    package_name = entry['X-Flatpak']
+                                else:
+                                    # Pokud X-Flatpak není k dispozici, použijeme název souboru
+                                    package_name = os.path.basename(desktop_file).replace('.desktop', '')
+                            else:
+                                # Pro běžné aplikace
+                                if 'Exec' in entry:
+                                    exec_path = entry['Exec']
+                                    package_name = exec_path.split()[0].split('/')[-1]
+                                elif 'Name' in entry:
+                                    package_name = entry['Name'].lower()
+
+                            if package_name:
+                                categories = [cat.strip() for cat in entry['Categories'].split(';') if cat.strip()]
+                                for category in categories:
+                                    if category not in categories_map:
+                                        categories_map[category] = set()
+                                    categories_map[category].add(package_name)
+                except Exception as e:
+                    print(f"Warning: Could not process {desktop_file}: {e}")
+
+        return categories_map
+
+    def handle_category_export(category):
+        """
+        Exportuje všechny balíčky z dané kategorie
+        """
+        categories_map = get_desktop_files_categories()
+
+        if category not in categories_map:
+            print_status(f"Category '{category}' not found.", "warning")
+            print(f"\n{colors.BWhite}Available categories:{colors.NC}")
+            for cat in sorted(categories_map.keys()):
+                print_category(cat)
+        else:
+            print_status(f"Exporting packages from category: {category}", "info")
+            handle_specific_packages(list(categories_map[category]))
+
+    def export_progress(current, total):
+        """Zobrazí progress bar"""
+        bar_width = 40
+        progress = int(bar_width * current / total)
+        print(f"\r{colors.BCyan}Progress: [{colors.BGreen}{'=' * progress}{' ' * (bar_width - progress)}{colors.BCyan}] {current}/{total}{colors.NC}", end='')
+        if current == total:
+            print()
+
+    def handle_specific_packages(packages):
+        package_managers = ['apt', 'dnf', 'pacman', 'zypper']  # Přidání zypper do seznamu
+
+        for package in packages:
+            if '.' in package:  # Flatpak aplikace
+                config["flatpak"][package] = "flatpak"
+                continue
+
+            # Nejdřív zkontrolujeme, jestli je to Homebrew balíček
+            if shutil.which('brew'):
+                brew_result = search_brew(package)
+                if brew_result and package in brew_result:
+                    config["brew"][package] = "brew"
+                    continue  # Pokud je to brew balíček, už nehledáme v ostatních
+
+            # Pokud to není brew balíček, hledáme v ostatních package managerech
+            found = False
+            for pm in package_managers:
+                if not shutil.which(pm):
+                    continue
+
+                result = None
+                if pm == 'apt':
+                    result = search_apt(package)
+                elif pm == 'dnf':
+                    result = search_dnf(package)
+                elif pm == 'pacman':
+                    result = search_pacman(package)
+                elif pm == 'zypper':  # Implementace pro zypper
+                    result = search_zypper(package)
+
+                if result and package in result:
+                    if package not in config["packages"]:
+                        config["packages"][package] = []
+                    config["packages"][package].append(pm)
+                    found = True
+
+            if not found:
+                print(f"Warning: Package '{package}' not found in any package manager")
+
+    def get_installed_packages():
+        """
+        Získá seznam nainstalovaných uživatelských balíčků (bez systémových knihoven)
+        """
+        installed = {}
+
+        # Seznam běžných systémových balíčků a prefixů, které chceme přeskočit
+        system_prefixes = [
+            'lib', 'glib', 'gtk', 'python', 'kernel', 'xorg', 'mesa', 'gcc',
+            'glibc', 'systemd', 'udev', 'dbus', 'perl', 'ruby',
+            'fonts-', 'x11-', 'wayland', 'qt', 'kde-', 'plasma-', 'gnome-',
+        ]
+
+        def is_system_package(pkg_name):
+            """Kontroluje, zda je balíček systémový"""
+            return any(pkg_name.startswith(prefix) for prefix in system_prefixes)
+
+        # APT balíčky
+        if shutil.which('apt'):
+            try:
+                cmd = "apt-mark showmanual"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    for pkg in result.stdout.splitlines():
+                        pkg = pkg.strip()
+                        if pkg and not is_system_package(pkg):
+                            installed[pkg] = ['apt']
+            except subprocess.CalledProcessError:
+                pass
+
+        # DNF balíčky
+        if shutil.which('dnf'):
+            try:
+                cmd = "dnf history userinstalled"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        pkg = line.split('.')[0].strip()
+                        if pkg and not is_system_package(pkg):
+                            if pkg in installed:
+                                installed[pkg].append('dnf')
+                            else:
+                                installed[pkg] = ['dnf']
+            except subprocess.CalledProcessError:
+                pass
+
+        # Pacman balíčky
+        if shutil.which('pacman'):
+            try:
+                cmd = "pacman -Qe"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        pkg = line.split()[0].strip()
+                        if pkg and not is_system_package(pkg):
+                            if pkg in installed:
+                                installed[pkg].append('pacman')
+                            else:
+                                installed[pkg] = ['pacman']
+            except subprocess.CalledProcessError:
+                pass
+
+        # Zypper balíčky
+        if shutil.which('zypper'):
+            try:
+                cmd = "zypper search --installed-only"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        # Zpracujeme každý řádek, abychom získali název balíčku
+                        parts = line.split('|')
+                        if len(parts) > 2:
+                            pkg_name = parts[2].strip()
+                            installed[pkg_name] = "zypper"
+            except subprocess.CalledProcessError:
+                pass
+
+        return installed
+
+    def get_installed_flatpaks():
+        installed = {}
+        if shutil.which('flatpak'):
+            try:
+                cmd = "flatpak list --app --columns=application"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    for pkg in result.stdout.splitlines():
+                        if pkg.strip():
+                            installed[pkg.strip()] = "flatpak"
+            except subprocess.CalledProcessError:
+                pass
+        return installed
+
+    def get_installed_brews():
+        installed = {}
+        if shutil.which('brew'):
+            try:
+                env = os.environ.copy()
+                env['PATH'] = f"/home/linuxbrew/.linuxbrew/bin:{env['PATH']}"
+                cmd = "brew leaves"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+                if result.returncode == 0:
+                    for pkg in result.stdout.splitlines():
+                        if pkg.strip():
+                            installed[pkg.strip()] = "brew"
+            except subprocess.CalledProcessError:
+                pass
+        return installed
+
+    def export_summary():
+        """Zobrazí souhrn exportu"""
+        print(f"\n{colors.BWhite}Export Summary:{colors.NC}")
+        print(f"{colors.BCyan}Configuration exported to: {colors.BWhite}{output_file}{colors.NC}")
+        print(f"\n{colors.BWhite}Total packages exported:{colors.NC}")
+        print(f"{colors.BGreen} ▪ Standard packages: {len(config['packages'])}{colors.NC}")
+        print(f"{colors.BPurple} ▪ Flatpak applications: {len(config['flatpak'])}{colors.NC}")
+        print(f"{colors.BYellow} ▪ Homebrew packages: {len(config['brew'])}{colors.NC}")
+
+        total = len(config['packages']) + len(config['flatpak']) + len(config['brew']) + len(config['zypper'])
+        print(f"\n{colors.BWhite}Total: {total} packages{colors.NC}")
+        print(f"\n{colors.BCyan}You can use this file with setup-custom command{colors.NC}")
+
+    # Main export logic
+    print_status("Starting export process...", "info")
+
+    if isinstance(args.package, str):
+        packages = [args.package]
+    else:
+        packages = args.package
+
+    expanded_packages = resolve_aliases(packages)
+
+    total_packages = len(packages)
+
+    for i, package in enumerate(expanded_packages, 1):
+        if package == '@c-all':
+            print_status("Exporting all installed packages...", "info")
+            config["packages"] = get_installed_packages()
+            config["flatpak"] = get_installed_flatpaks()
+            config["brew"] = get_installed_brews()
+        elif package.startswith('@c-'):
+            category = package[3:]
+            handle_category_export(category)
+        else:
+            handle_specific_packages([package])
+
+            export_progress(i, total_packages)
+
+
+    # Export to JSON file
+    output_file = "packages_export.json"
+    with open(output_file, 'w') as f:
+        json.dump(config, f, indent=2)
+
+    print_status("Export completed successfully!", "success")
+    export_summary()
+
+# package managment
+
+def search(args):
+    search_term = " ".join(args.package).lower()
+    colors = Colors()
+
+    # Funkce pro vyhledávání v jednotlivých repozitářích
+    def search_repo(repo_info):
+        repo, search_func = repo_info
+        # 'betterpkg' není skutečný binární správce, proto jej vždy povolíme
+        if repo != "betterpkg" and not shutil.which(repo):
+            return repo, []
+
+        try:
+            result = search_func(search_term, description=args.description)
+            return repo, result if result else []
+        except Exception as e:
+            print(f"Error searching in {repo}: {e}")
+            return repo, []
+
+    # Definice repozitářů a jejich vyhledávacích funkcí
+    search_repos = [
+        ('pacstall', search_pacstall),
+        ('apt', search_apt),
+        ('dnf', search_dnf),
+        ('pacman', search_pacman),
+        ('zypper', search_zypper),
+        ('yay', search_yay),
+        ('paru', search_paru),
+        ('flatpak', search_flatpak),
+        ('snap', search_snap),
+        ('brew', search_brew),
+        ('betterpkg', search_betterpkg)
+    ]
+    
+    if not args.json:
+        print(f"\n{colors.BYellow}Searching for: {search_term}{colors.NC}\n")
+
+    # Paralelní vyhledávání
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(search_repos)) as executor:
+        search_results = executor.map(search_repo, search_repos)
+        results = dict(search_results)
+
+    if args.json:
+        # Vrácení JSON výstupu
+        json_output = {
+            "search_term": search_term,
+            "results": [
+                {"repo": repo, "packages": pkgs} for repo, pkgs in results.items() if pkgs
+            ]
+        }
+        print(json.dumps(json_output, indent=2))
+        return json_output
+
+    # Kontrola, zda byly nalezeny nějaké výsledky
+    if not any(results.values()):
+        print(f"{colors.BRed}No packages found matching '{search_term}'!{colors.NC}")
+        return None
+
+    # Příprava výsledků pro zobrazení
+    packages = []
+    count = 0
+
+    # Nastavení barev pro různé package managery
+    repo_colors = {
+        'pacstall': colors.BPurple,
+        'apt': colors.BGreen,
+        'dnf': colors.BCyan,
+        'zypper': colors.BYellow,
+        'pacman': colors.BYellow,
+        'yay': colors.BRed,
+        'paru': colors.BRed,
+        'flatpak': colors.c1,
+        'snap': colors.c4,
+        'brew': colors.c3,
+        'betterpkg': colors.BYellow,
+    }
+
+    # Sloučení a seřazení výsledků podle názvu balíčku
+    all_packages = []
+    for repo, pkgs in results.items():
+        if pkgs:
+            for pkg in pkgs:
+                all_packages.append((pkg, repo))
+
+    # Seřazení podle názvu balíčku
+    all_packages.sort(key=lambda x: x[0].lower())
+
+    # Zobrazení výsledků
+    for pkg, repo in all_packages:
+        repo_color = repo_colors.get(repo, colors.BWhite)
+        print(f"[{colors.BWhite}{count}{colors.NC}]: {colors.BGreen}{pkg}{colors.NC} ({repo_color}{repo}{colors.NC})")
+        packages.append((repo, pkg))
+        count += 1
+
+    if count > 0:
+        print(f"\n{colors.BYellow}Total packages found: {count}{colors.NC}")
+
+    return packages if not args.command == 'search' else None
+
+def install(args):
+    """Nainstaluje vybrané balíčky."""
+    colors = Colors()
+    selected_packages = {}  # {repo: [packages]}
+
+    def fetch_official_source(pkg, y):
+        """
+        Stáhne balíček z ověřeného zdroje (preferuje Flatpak/Snap, pak známé URL, pak GitHub).
+        """
+
+        import distro
+
+        # Definice ověřených Snap balíčků (preferované)
+        verified_snaps = {
+            "vlc": "vlc",
+            "spotify": "spotify",
+            "slack": "slack",
+        }
+
+        # Definice ověřených přímých URL pro balíčky podle systému
+        # načti verified_urls z externího JSON souboru na GitHubu
+
+        def get_verified_urls():
+            url = "https://raw.githubusercontent.com/ExistingPerson08/Better-pkg-data/main/verified_urls.json"
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    return resp.json()
+                else:
+                    print(f"{colors.BYellow}Warning: Could not fetch verified_urls.json from GitHub (status {resp.status_code}), using empty list.{colors.NC}")
+                    return {}
+            except Exception as e:
+                print(f"{colors.BYellow}Warning: Could not fetch verified_urls.json from GitHub: {e}{colors.NC}")
+                return {}
+
+        verified_urls = get_verified_urls()
+
+        # Zjištění distribuce a ID
+        def get_distro_id():
+            try:
+                if shutil.which("dnf") and not shutil.which("rpm-ostree"):
+                    return "fedora"
+                elif shutil.which("apt"):
+                    # Rozlišení mezi debian/ubuntu
+                    try:
+                        with open("/etc/os-release") as f:
+                            lines = f.readlines()
+                            for line in lines:
+                                if line.startswith("ID="):
+                                    val = line.strip().split("=")[1].replace('"', '')
+                                    if val in ["debian", "ubuntu"]:
+                                        return val
+                        return "debian"
+                    except Exception:
+                        pass
+                    return "debian"
+                elif shutil.which("zypper"):
+                    return "opensuse"
+                else:
+                    return distro.id()
+            except Exception:
+                # fallback na os-release
+                try:
+                    with open("/etc/os-release") as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            if line.startswith("ID="):
+                                val = line.strip().split("=")[1].replace('"', '')
+                                return val
+                except Exception:
+                    return "unknown"
+                    val = line.strip().split("=")[1].replace('"', '')
+                    return val
+            except Exception:
+                return "unknown"
+
+        distro_id = get_distro_id()
+
+        # 1. Preferuj ověřené URL pro danou distribuci (přesně podle klíče v JSON)
+        if pkg.lower() in verified_urls:
+            url_map = verified_urls[pkg.lower()]
+            url = url_map.get(distro_id)
+            if url:
+                if not y:
+                    confirm = input(f"{colors.BYellow}Are you sure you want to install {pkg} from its website? (y/N) {colors.NC}").strip().lower()
+                    if not confirm.startswith('y'):
+                        sys.exit(1)
+                # Stáhni soubor do /tmp
+                out_file = f"/tmp/{pkg}-{os.path.basename(url.split('?')[0])}"
+                print(f"{colors.BCyan}Downloading {pkg} from {url}{colors.NC}")
+                
+                if not shutil.which("wget"):
+                    print(f"{colors.BRed}It looks like you dont have Wget installed, please install it.{colors.NC}")
+                    return None
+                try:
+                    subprocess.run(["wget", "-O", out_file, url], check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"{colors.BRed}Error downloading {pkg} from {url}: {e}{colors.NC}")
+                    return None
+                print(f"{colors.BGreen}Downloaded to {out_file}{colors.NC}")
+                return out_file
+
+        # 2. Preferuj Snap pokud je k dispozici a nainstalovaný
+        if shutil.which("snap") and pkg.lower() in verified_snaps:
+            snap_id = verified_snaps[pkg.lower()]
+
+            if not y:
+                confirm = input(f"{colors.BYellow}Are you sure you want to install {pkg} from Snap store? (y/N) {colors.NC}").strip().lower()
+                if not confirm.startswith('y'):
+                    sys.exit(1)
+
+            print(f"{colors.BCyan}Installing {pkg} from Snap Store: {snap_id}{colors.NC}")
+            try:
+                subprocess.run(["sudo", "snap", "install", snap_id], check=True)
+                print(f"{colors.BGreen}Successfully installed {pkg} from Snap Store.{colors.NC}")
+            except subprocess.CalledProcessError as e:
+                return None  # Snap je nainstalován, není co stahovat
+
+        # 3. GitHub releases
+        github_search_url = f"https://api.github.com/search/repositories?q={pkg}&sort=stars&order=desc"
+        try:
+            resp = requests.get(github_search_url, timeout=5)
+            if resp.status_code == 200:
+                items = resp.json().get("items", [])
+                if items:
+                    repo = items[0]
+                    repo_full_name = repo["full_name"]
+                    # Získání posledního release
+                    releases_url = f"https://api.github.com/repos/{repo_full_name}/releases/latest"
+                    rel_resp = requests.get(releases_url, timeout=5)
+                    if rel_resp.status_code == 200:
+                        rel = rel_resp.json()
+                        assets = rel.get("assets", [])
+                        if assets:
+                            # Najdi asset, který odpovídá systému (např. .deb, .AppImage, .tar.gz, .zip, .rpm)
+                            if not y:
+                                confirm = input(f"{colors.BYellow}Are you sure you want to install {pkg} from Github? (y/N) {colors.NC}").strip().lower()
+                                if not confirm.startswith('y'):
+                                    raise Exception("Installation cancelled by user")
+                        
+                            for asset in assets:
+                                url = asset["browser_download_url"]
+                                if any(ext in url for ext in [".deb", ".AppImage", ".tar.gz", ".zip", ".rpm"]):
+                                    print(f"{colors.BCyan}Downloading {pkg} from {url}{colors.NC}")
+                                    out_file = f"/tmp/{pkg}-{asset['name']}"
+                                    subprocess.run(["wget", "-O", out_file, url], check=True)
+                                    print(f"{colors.BGreen}Downloaded to {out_file}{colors.NC}")
+                                    return out_file
+                            # Pokud nenalezeno, stáhni první asset
+                            url = assets[0]["browser_download_url"]
+                            print(f"{colors.BCyan}Downloading {pkg} from {url}{colors.NC}")
+                            out_file = f"/tmp/{pkg}-{assets[0]['name']}"
+                            subprocess.run(["wget", "-O", out_file, url], check=True)
+                            print(f"{colors.BGreen}Downloaded to {out_file}{colors.NC}")
+                            return out_file
+        except Exception as e:
+            print(f"{colors.BRed}Error fetching official source for {pkg}: {e}{colors.NC}")
+        
+        # 4. Flatpaky z flathub-verified pokud je Flatpak nainstalovaný
+        if shutil.which("flatpak"):
+            # Přidej remote flathub-verified pokud ještě není
+            subprocess.run([
+            "flatpak", "remote-add", "--if-not-exists", "--subset=verified",
+            "flathub-verified", "https://flathub.org/repo/flathub.flatpakrepo"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # Hledej balíček ve verified remote pomocí flatpak remote-ls
+            try:
+                search_cmd = ["flatpak", "remote-ls", "flathub-verified"]
+                result = subprocess.run(search_cmd, capture_output=True, text=True)
+                lines = result.stdout.splitlines()
+                # Hledej řádky obsahující hledaný balíček (case-insensitive)
+                matches = [line for line in lines if pkg.lower() in line.lower()]
+                if matches:
+                    # První sloupec je název, druhý je app_id
+                    app_id = matches[0].split('\t')[1]
+
+                    if not y:
+                        confirm = input(f"{colors.BYellow}Are you sure you want to install {pkg} from Flathub? (y/N) {colors.NC}").strip().lower()
+                        if not confirm.startswith('y'):
+                            raise Exception("Installation cancelled by user")
+                    
+                    print(f"{colors.BCyan}Installing {pkg} from Flathub Verified as Flatpak: {app_id}{colors.NC}")
+                    subprocess.run(["flatpak", "install", "-y", "flathub-verified", app_id])
+                else:
+                    subprocess.run(["flatpak", "remote-delete", "flathub-verified"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return None  # Flatpak je nainstalován, není co stahovat
+            except Exception as e:
+                print(f"{colors.BYellow}Flatpak verified search failed: {e}{colors.NC}")
+            
+            try:
+                subprocess.run(["flatpak", "remote-delete", "flathub-verified"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"{colors.BYellow}Failed to remove flathub-verified remote: {e}{colors.NC}")
+
+        return None
+
+    def get_repo_categories():
+        """Získá kategorie/skupiny z repozitářů"""
+        categories = {}
+
+        # APT kategorie
+        if shutil.which('apt'):
+            try:
+                cmd = "apt-cache show $(apt-cache pkgnames) | grep '^Section: ' | sort -u | cut -d' ' -f2"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['apt'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
+            except:
+                pass
+
+        # DNF kategorie
+        if shutil.which('dnf'):
+            try:
+                cmd = "dnf grouplist -v"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    groups = []
+                    for line in result.stdout.splitlines():
+                        if line.strip() and not line.startswith(' '):
+                            groups.append(line.strip())
+                    categories['dnf'] = groups
+            except:
+                pass
+
+        # Pacman kategorie
+        if shutil.which('pacman'):
+            try:
+                cmd = "pacman -Sg"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['pacman'] = [line.split()[0] for line in result.stdout.splitlines()]
+            except:
+                pass
+
+        # Zypper kategorie
+        if shutil.which('zypper'):
+            try:
+                cmd = "zypper -q groups"  # Získá seznam skupin balíčků
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['zypper'] = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            except:
+                pass
+
+        # Flatpak kategorie
+        if shutil.which('flatpak'):
+            try:
+                cmd = "flatpak search --columns=category | sort -u"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['flatpak'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
+            except:
+                pass
+
+        return categories
+
+    def get_packages_in_category(category, repo):
+        """Získá balíčky z dané kategorie pro daný repozitář"""
+        packages = []
+
+        if repo == 'apt':
+            cmd = f"apt-cache search . | grep '^[^:]*: Section: {category}'"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.split(':')[0] for line in result.stdout.splitlines()]
+            except:
+                pass
+
+        elif repo == 'dnf':
+            cmd = f"dnf group info '{category}'"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    in_packages = False
+                    for line in result.stdout.splitlines():
+                        if 'Mandatory Packages:' in line or 'Optional Packages:' in line:
+                            in_packages = True
+                            continue
+                        if in_packages and line.strip():
+                            packages.append(line.strip())
+            except:
+                pass
+
+        elif repo == 'pacman':
+            cmd = f"pacman -Sg {category}"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.split()[1] for line in result.stdout.splitlines()]
+            except:
+                pass
+
+        elif repo == 'zypper':
+            cmd = f"zypper -q search --type pattern {category}"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.split('|')[1].strip() for line in result.stdout.splitlines() if '|' in line]
+            except:
+                pass
+
+        elif repo == 'flatpak':
+            cmd = f"flatpak search --columns=application,category | grep -i {category}"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.split()[0] for line in result.stdout.splitlines()]
+            except:
+                pass
+
+        return packages
+
+    def handle_category_install(category):
+        """Zpracuje instalaci balíčků z dané kategorie"""
+        categories = get_repo_categories()
+        found = False
+
+        for repo, repo_categories in categories.items():
+            if category.lower() in [cat.lower() for cat in repo_categories]:
+                found = True
+                print(f"{colors.BCyan}Installing packages from category '{category}' ({repo}){colors.NC}")
+                packages = get_packages_in_category(category, repo)
+
+                if packages:
+                    if repo not in selected_packages:
+                        selected_packages[repo] = []
+                    selected_packages[repo].extend(packages)
+                    print(f"{colors.BGreen}Found {len(packages)} packages in category{colors.NC}")
+
+                    # Výpis nalezených balíčků
+                    for pkg in packages:
+                        print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+
+        if not found:
+            print(f"{colors.BRed}Category '{category}' not found.{colors.NC}")
+            print(f"\n{colors.BWhite}Available categories:{colors.NC}")
+            for repo, repo_categories in categories.items():
+                print(f"\n{colors.BCyan}{repo}:{colors.NC}")
+                for cat in sorted(repo_categories):
+                    print(f"{colors.BPurple}  • {cat}{colors.NC}")
+
+    # Rozšíří aliasy na reálné balíčky
+    expanded_packages = resolve_aliases(args.package)
+
+    if args.fetch:
+        for package in expanded_packages:
+            print(f"{colors.BCyan}Fetching official sources for packages...{colors.NC}")
+            if args.y:
+                out_file = fetch_official_source(package, y=True)
+            else:
+                out_file = fetch_official_source(package, y=False)
+            
+            if out_file:
+                # Pokus o instalaci podle typu souboru
+                if out_file.endswith(".deb"):
+                    subprocess.run(["sudo", "dpkg", "-i", out_file])
+                    subprocess.run(["sudo", "apt", "-f", "install", "-y"])
+                elif out_file.endswith(".AppImage"):
+                    subprocess.run(["chmod", "+x", out_file])
+                    print(f"{colors.BGreen}AppImage downloaded: {out_file}{colors.NC}")
+                elif out_file.endswith(".tar.gz") or out_file.endswith(".zip"):
+                    print(f"{colors.BGreen}Archive downloaded: {out_file}{colors.NC}, please install manually.")
+                elif out_file.endswith(".rpm"):
+                    subprocess.run(["sudo", "dnf", "install", out_file])
+                else:
+                    print(f"{colors.BYellow}Downloaded file: {out_file} (unknown type, install manually){colors.NC}")
+            else:
+                print(f"{colors.BRed}Could not fetch {package} from official source. {colors.NC}")
+        return
+    
+    if args.plugin:
+        import urllib.request
+
+        plugin_name = None
+        if args.package and len(args.package) > 0:
+            plugin_name = args.package[0]
+        if not plugin_name:
+            print(f"{colors.BRed}No plugin name specified.{colors.NC}")
+            return
+
+        plugin_url = f"https://raw.githubusercontent.com/ExistingPerson08/Better-pkg-data/main/plugins/{plugin_name}.py"
+        plugins_dir = os.path.expanduser("~/.local/share/better-tools/plugins/")
+        os.makedirs(plugins_dir, exist_ok=True)
+        plugin_path = os.path.join(plugins_dir, f"{plugin_name}.py")
+
+        try:
+            print(f"{colors.BCyan}Installing plugin '{plugin_name}'...{colors.NC}")
+            urllib.request.urlretrieve(plugin_url, plugin_path)
+            print(f"{colors.BGreen}Plugin '{plugin_name}' installed to {plugin_path}.{colors.NC}")
+        except Exception as e:
+            print(f"{colors.BRed}Failed to install plugin '{plugin_name}': {e}{colors.NC}")
+        return
+
+    #Zpracování každého argumentu
+    for package in expanded_packages:
+        if package.startswith('@c-'):
+            # Instalace kategorie (původní chování)
+            category = package[3:]
+            handle_category_install(category)
+        else:
+            # Standardní instalace balíčku
+            args.package = [package]
+            packages = search(args)
+            if not packages:
+                continue
+
+            if args.first:
+                selected = '0'
+                print(f"{colors.BYellow}Auto-selecting first match for {package}{colors.NC}")
+            else:
+                print(f"\nSelect which {package} to install [0-{len(packages)-1}] (or type c to skip): ", end='')
+                selected = input().strip()
+
+                if selected.lower() == 'c':
+                    print(f"{colors.BYellow}Skipping {package}...{colors.NC}")
+                    continue  # Přeskočí balíček, pokud je zadané 'c'
+
+                if selected == '':
+                    selected = '0'  # Pokud zmáčkne Enter, automaticky 0
+
+            try:
+                index = int(selected)
+                if not 0 <= index < len(packages):
+                    print(f"{colors.BRed}Invalid selection{colors.NC}")
+                    continue
+
+                if not args.json:
+                    repo, pkg = packages[index]
+                else:
+                    print(f"{colors.BRed}You can not install packages in JSON mode.{colors.NC}")
+                    return
+
+                if repo not in selected_packages:
+                    selected_packages[repo] = []
+                selected_packages[repo].append(pkg)
+                print(f"{colors.BGreen}Selected '{pkg}' from {repo}{colors.NC}")
+
+            except ValueError:
+                print(f"{colors.BRed}Invalid input{colors.NC}")
+                continue
+
+    if not selected_packages:
+        print(f"{colors.BYellow}No packages selected for installation{colors.NC}")
+        return
+
+    # Zobrazení souhrnu a potvrzení
+    print(f"\n{colors.BWhite}Packages to install:{colors.NC}")
+    for repo, pkgs in selected_packages.items():
+        print(f"{colors.BCyan}{repo}:{colors.NC}")
+        for pkg in pkgs:
+            print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+
+    confirm = input(f"\n{colors.BYellow}Are you sure? (y/N) {colors.NC}").lower()
+    if not confirm.startswith('y'):
+        return
+
+    # Instalace balíčků
+    for repo, pkgs in selected_packages.items():
+        install_package(pkgs, repo)
+
+def remove(args):
+    """Odstraní vybrané balíčky."""
+    colors = Colors()
+    selected_packages = {}  # {repo: [packages]}
+
+    def get_repo_categories():
+        """Získá kategorie/skupiny z repozitářů"""
+        categories = {}
+
+        # APT kategorie
+        if shutil.which('apt'):
+            try:
+                cmd = "apt-cache show $(apt-cache pkgnames) | grep '^Section: ' | sort -u | cut -d' ' -f2"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['apt'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
+            except:
+                pass
+
+        # DNF kategorie
+        if shutil.which('dnf'):
+            try:
+                cmd = "dnf grouplist -v"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    groups = []
+                    for line in result.stdout.splitlines():
+                        if line.strip() and not line.startswith(' '):
+                            groups.append(line.strip())
+                    categories['dnf'] = groups
+            except:
+                pass
+
+        # Pacman kategorie
+        if shutil.which('pacman'):
+            try:
+                cmd = "pacman -Sg"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['pacman'] = [line.split()[0] for line in result.stdout.splitlines()]
+            except:
+                pass
+
+        # Zypper kategorie
+        if shutil.which('zypper'):
+            try:
+                cmd = "zypper -q groups"  # Získá seznam skupin balíčků
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['zypper'] = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            except:
+                pass
+
+        # Flatpak kategorie
+        if shutil.which('flatpak'):
+            try:
+                cmd = "flatpak search --columns=category | sort -u"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    categories['flatpak'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
+            except:
+                pass
+
+        return categories
+
+    def get_packages_in_category(category, repo):
+        """Získá nainstalované balíčky z dané kategorie pro daný repozitář"""
+        packages = []
+
+        if repo == 'apt':
+            cmd = f"dpkg-query -W -f='${{Package}} ${{Section}}\n' | grep '{category}' | cut -d' ' -f1"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            except:
+                pass
+
+        elif repo == 'dnf':
+            cmd = f"dnf group info '{category}' | grep '^   ' | cut -d' ' -f4"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    # Ověření, že balíčky jsou nainstalované
+                    for pkg in result.stdout.splitlines():
+                        check_cmd = f"rpm -q {pkg}"
+                        if subprocess.run(check_cmd, shell=True, stdout=subprocess.DEVNULL).returncode == 0:
+                            packages.append(pkg)
+            except:
+                pass
+
+        elif repo == 'pacman':
+            cmd = f"pacman -Qg {category}"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.split()[1] for line in result.stdout.splitlines()]
+            except:
+                pass
+
+        elif repo == 'zypper':
+            cmd = f"zypper -q search --type pattern {category}"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.split('|')[1].strip() for line in result.stdout.splitlines() if '|' in line]
+            except:
+                pass
+
+        elif repo == 'flatpak':
+            cmd = f"flatpak list --app --columns=application,category | grep -i {category} | cut -f1"
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    packages = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            except:
+                pass
+
+        return packages
+
+    def handle_category_remove(category):
+        """Zpracuje odstranění balíčků z dané kategorie"""
+        categories = get_repo_categories()
+        found = False
+
+        for repo, repo_categories in categories.items():
+            if category.lower() in [cat.lower() for cat in repo_categories]:
+                found = True
+                print_status(f"Finding installed packages from category '{category}' ({repo})", "info")
+                packages = get_packages_in_category(category, repo)
+
+                if packages:
+                    if repo not in selected_packages:
+                        selected_packages[repo] = []
+                    selected_packages[repo].extend(packages)
+                    print_status(f"Found {len(packages)} installed packages in category", "success")
+
+                    # Výpis nalezených balíčků
+                    for pkg in packages:
+                        print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+
+        if not found:
+            print_status(f"Category '{category}' not found", "error")
+            print(f"\n{colors.BWhite}Available categories:{colors.NC}")
+            for repo, repo_categories in categories.items():
+                print(f"\n{colors.BCyan}{repo}:{colors.NC}")
+                for cat in sorted(repo_categories):
+                    print(f"{colors.BPurple}  • {cat}{colors.NC}")
+
+    if args.plugin:
+        plugin_name = None
+        if args.package and len(args.package) > 0:
+            plugin_name = args.package[0]
+        if not plugin_name:
+            print(f"{colors.BRed}No plugin name specified.{colors.NC}")
+            return
+
+        plugins_dir = os.path.expanduser("~/.local/share/better-tools/plugins/")
+        plugin_path = os.path.join(plugins_dir, f"{plugin_name}.py")
+
+        if os.path.exists(plugin_path):
+            try:
+                os.remove(plugin_path)
+                print(f"{colors.BGreen}Plugin '{plugin_name}' was removed from {plugin_path}.{colors.NC}")
+            except Exception as e:
+                print(f"{colors.BRed}Failed to remove plugin '{plugin_name}': {e}{colors.NC}")
+        else:
+            print(f"{colors.BYellow}Plugin '{plugin_name}' does not exist in {plugins_dir}.{colors.NC}")
+        return
+    
+    # Rozšíří aliasy na reálné balíčky
+    expanded_packages = resolve_aliases(args.package)
+
+    # Zpracování každého argumentu
+    for package in expanded_packages:
+        if package.startswith('@c-'):
+            # Odstranění kategorie
+            category = package[3:]
+            handle_category_remove(category)
+        else:
+            # Standardní odstranění balíčku
+            args.package = [package]
+            packages = search(args)
+            if not packages:
+                print_status(f"Package '{package}' not found", "warning")
+                continue
+
+            if args.first:
+                selected = '0'
+                print(f"{colors.BYellow}Auto-selecting first match for {package}{colors.NC}")
+            else:
+                prompt = f"\nSelect which {package} to remove [0-{len(packages)-1}] (or type c to skip): "
+                selected = input(prompt).strip()
+
+                if selected.lower() == 'c':
+                    print(f"{colors.BYellow}Skipping {package}...{colors.NC}")
+                    continue
+
+            try:
+                index = int(selected)
+                if not 0 <= index < len(packages):
+                    print_status("Invalid selection", "error")
+                    continue
+
+                if not args.json:
+                    repo, pkg = packages[index]
+                else:
+                    print_status("You can not remove packages in JSON mode.", "error")
+                    return
+
+                if repo not in selected_packages:
+                    selected_packages[repo] = []
+                selected_packages[repo].append(pkg)
+                print_status(f"Selected '{pkg}' from {repo}", "success")
+
+            except ValueError:
+                print_status("Invalid input", "error")
+                continue
+
+
+    if not selected_packages:
+        print_status("No packages selected for removal", "warning")
+        return
+
+    # Zobrazení souhrnu a potvrzení
+    print(f"\n{colors.BWhite}Packages to remove:{colors.NC}")
+    for repo, pkgs in selected_packages.items():
+        print(f"{colors.BCyan}{repo}:{colors.NC}")
+        for pkg in pkgs:
+            print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+
+    confirm = input(f"\n{colors.BYellow}Are you sure you want to remove these packages? (y/N) {colors.NC}").lower()
+    if not confirm.startswith('y'):
+        print_status("Operation cancelled", "warning")
+        return
+
+    # Odstranění balíčků
+    failed_removals = []
+    total_removed = 0
+
+    for repo, pkgs in selected_packages.items():
+        print_status(f"Removing packages from {repo}...", "info")
+        pkg_str = " ".join(pkgs)
+
+        if repo == "apt":
+            cmd = f"sudo {'nala' if shutil.which('nala') else 'apt'} {'purge' if args.purge else 'remove'} {pkg_str} -y"
+        elif repo == "dnf":
+            cmd = f"sudo dnf {'remove --allowerasing' if args.purge else 'remove'} {pkg_str} -y"
+        elif repo == "pacman":
+            cmd = f"sudo pacman -{('Rns' if args.purge else 'R')} --noconfirm {pkg_str}"
+        elif repo == "zypper":
+            cmd = f"sudo zypper remove {'--delete-orphans' if args.purge else ''} {pkg_str} -y"
+        elif repo == "flatpak":
+            cmd = f"flatpak remove {'--delete-data' if args.purge else ''} {pkg_str} -y"
+        elif repo == "snap":
+            cmd = f"sudo snap remove {'--purge' if args.purge else ''} {pkg_str}"
+        elif repo == "brew":
+            cmd = f"brew uninstall {pkg_str}"
+        elif repo == "yay":
+            cmd = f"sudo yay -{('Rns' if args.purge else 'R')} --noconfirm {pkg_str}"
+        elif repo == "paru":
+            cmd = f"sudo paru -{('Rns' if args.purge else 'R')} --noconfirm {pkg_str}"
+        elif repo == "pacstall":
+            cmd = f"pacstall -R {pkg_str} -y"
+        elif repo == "betterpkg":
+            pkg_str = " ".join(pkgs)
+            if shutil.which("apt"):
+                cmd = f"sudo {'nala' if shutil.which('nala') else 'apt'} {'purge' if args.purge else 'remove'} {pkg_str} -y"
+            elif shutil.which("dnf"):
+                cmd = f"sudo dnf {'remove --allowerasing' if args.purge else 'remove'} {pkg_str} -y"
+            elif shutil.which("zypper"):
+                cmd = f"sudo zypper remove {pkg_str} -y"
+        else:
+            print_status(f"Unsupported package manager: {repo}", "error")
+            continue
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1
+            )
+
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    print(output.strip())
+
+            if process.returncode == 0:
+                print_status(f"Successfully removed packages from {repo}", "success")
+                total_removed += len(pkgs)
+            else:
+                failed_removals.extend([(repo, pkg) for pkg in pkgs])
+                print_status(f"Error removing packages from {repo}", "error")
+
+        except Exception as e:
+            print_status(f"Error: {str(e)}", "error")
+            failed_removals.extend([(repo, pkg) for pkg in pkgs])
+
+    # Zobrazení souhrnu
+    print(f"\n{colors.BWhite}Removal Summary:{colors.NC}")
+    print(f"{colors.BCyan}Total packages processed: {sum(len(pkgs) for pkgs in selected_packages.values())}{colors.NC}")
+
+    if total_removed > 0:
+        print(f"\n{colors.BWhite}Successfully removed packages:{colors.NC}")
+        for repo, pkgs in selected_packages.items():
+            if repo not in [f[0] for f in failed_removals]:
+                for pkg in pkgs:
+                    print(f"{colors.BGreen}  • {pkg} ({repo}){colors.NC}")
+
+    if failed_removals:
+        print(f"\n{colors.BWhite}Failed to remove:{colors.NC}")
+        for repo, pkg in failed_removals:
+            print(f"{colors.BRed}  • {pkg} ({repo}){colors.NC}")
+
+    if args.purge:
+        print(f"\n{colors.BCyan}Note: Packages were removed with their configuration files (purge){colors.NC}")
+
+#další užitečné package manager funkce
+
+def handle_package(args):
+    package = args.package
+    colors = Colors()
+
+    package_managers = [
+        ("pacman", f"pacman -Qi {package}", f"sudo pacman -S {package}", f"sudo pacman -D --asdeps {package}", f"sudo pacman -D --asexplicit {package}", f"pacman -Si {package}"),
+        ("apt", f"apt show {package}", f"sudo apt update && sudo apt install -y {package}", f"sudo apt-mark hold {package}", f"sudo apt-mark unhold {package}", f"apt policy {package}"),
+        ("zypper", f"zypper info {package}", f"sudo zypper install -y {package}", None, None, f"zypper info {package}"),
+        ("dnf", f"dnf info {package}", f"sudo dnf install -y {package}", None, None, f"dnf repoquery --info {package}"),
+        ("flatpak", f"flatpak info {package}", f"flatpak update {package}", None, None, None),
+        ("snap", f"snap info {package}", f"sudo snap refresh {package}", None, None, None),
+        ("brew", f"brew info {package}", f"brew upgrade {package}", None, None, None),
+        ("yay", f"yay -Qi {package}", f"yay -S {package}", None, None, None),
+        ("paru", f"paru -Qi {package}", f"paru -S {package}", None, None, None)
+    ]
+
+    for pm_data in package_managers:
+        pm = pm_data[0]
+        cmd = pm_data[1]
+        update_cmd = pm_data[2]
+        hold_cmd = pm_data[3]
+        unhold_cmd = pm_data[4]
+        repo_cmd = pm_data[5]
+
+        if args.info:
+            try:
+                subprocess.run(cmd, shell=True, check=True)
+                return
+            except subprocess.CalledProcessError:
+                continue
+        elif args.status:
+            try:
+                result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout:
+                    print(f"{colors.BGreen}✅ {package} is installed ({pm}).{colors.NC}")
+                    return
+            except subprocess.CalledProcessError:
+                continue
+        elif args.update and update_cmd:
+            try:
+                result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f"{colors.BCyan}🔄 Updating {package} using {pm}...{colors.NC}")
+                    subprocess.run(update_cmd, shell=True, check=True)
+                    print(f"{colors.BGreen}✅ {package} has been updated ({pm}).{colors.NC}")
+                    return
+            except subprocess.CalledProcessError:
+                continue
+        elif args.hold and hold_cmd:
+            try:
+                result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f"{colors.BPurple}🔒 Holding {package} using {pm}...{colors.NC}")
+                    subprocess.run(hold_cmd, shell=True, check=True)
+                    print(f"{colors.BGreen}✅ {package} is now held ({pm}).{colors.NC}")
+                    return
+            except subprocess.CalledProcessError:
+                continue
+        elif args.unhold and unhold_cmd:
+            try:
+                result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+                if result.returncode == 0:
+                    print(f"{colors.BPurple}🔓 Unholding {package} using {pm}...{colors.NC}")
+                    subprocess.run(unhold_cmd, shell=True, check=True)
+                    print(f"{colors.BGreen}✅ {package} is now unheld ({pm}).{colors.NC}")
+                    return
+            except subprocess.CalledProcessError:
+                continue
+        elif args.repo and repo_cmd:
+            try:
+                result = subprocess.run(repo_cmd, shell=True, check=True, capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout:
+                    print(f"{colors.BCyan}📦 {package} comes from the following repository ({pm}):{colors.NC}\n{result.stdout}")
+                    return
+            except subprocess.CalledProcessError:
+                continue
+
+    print(f"{colors.BRed}❌ Package {package} could not be processed. It may not be installed or supported.{colors.NC}")
+
+def handle_discover(args):
+    """
+    Něco jako obchod s aplikacemi, ale pro CLI.
+    """
+    import platform
+    import datetime
+    import requests
+
+    colors = Colors()
+    distro = ""
+    if shutil.which("dnf"):
+        distro = "fedora"
+    elif shutil.which("apt"):
+        distro = "debian"
+    elif shutil.which("pacman"):
+        distro = "arch"
+    elif shutil.which("zypper"):
+        distro = "opensuse"
+    else:
+        distro = platform.system().lower()
+
+    # Predefined collections for various purposes
+    collections = {
+        "dev-tools": ["git", "vim", "neovim", "micro", "code", "zed", "gcc", "make", "cmake", "python3", "nodejs", "npm", "docker", "podman", "distrobox"],
+        "media-suite": ["vlc", "mpv", "gimp", "inkscape", "kdenlive", "audacity", "shotcut", "obs-studio", "krita"],
+        "gaming-starter": ["steam", "lutris", "heroic-games-launcher", "bottles", "prismlauncher", "mangohud", "goverlay"],
+        "privacy": ["tor", "signal-desktop", "protonvpn", "keepassxc", "veracrypt", "cryptomator"],
+        "sysadmin": ["htop", "btop", "fastfetch", "ncdu", "gparted", "timeshift", "rsync", "rclone", "restic"],
+        "office": ["libreoffice", "onlyoffice", "zotero", "obsidian", "calibre"],
+        "security": ["ufw", "fail2ban", "clamav", "gufw", "rkhunter", "lynis", "auditd"],
+        "web": ["firefox", "brave", "chromium", "librewolf", "vivaldi", "tor-browser"],
+        "cloud": ["docker", "podman", "distrobox", "kubectl", "terraform", "ansible", "minikube"],
+    }
+
+    # Featured packages (hand-picked, cross-platform)
+    featured_packages = [
+        ("bat", "Modern alternative to cat with syntax highlighting"),
+        ("btop", "Advanced terminal system monitor"),
+        ("fd", "Fast file search in terminal"),
+        ("ripgrep", "Fast file content search (grep on steroids)"),
+        ("fastfetch", "Fast system info fetch (neofetch alternative)"),
+        ("zoxide", "Smart directory jumper for terminal"),
+        ("starship", "Modern shell prompt"),
+        ("lazygit", "TUI git client"),
+        ("micro", "Simple modern terminal text editor"),
+        ("bottom", "Another terminal system monitor"),
+        ("yt-dlp", "Download videos from YouTube and more"),
+        ("dust", "Disk usage analyzer"),
+        ("procs", "Enhanced ps for processes"),
+        ("eza", "Modern alternative to ls"),
+        ("tldr", "Simplified command manuals"),
+        ("glow", "Markdown viewer in terminal"),
+        ("broot", "Interactive terminal file browser"),
+    ]
+
+    # New/updated packages from repositories (not just upgradable in system)
+    def get_new_updated_repo_packages():
+        pkgs = []
+        if distro == "arch" and shutil.which("pacman"):
+            try:
+                result = subprocess.run("pacman -Slq | head -n 20", shell=True, capture_output=True, text=True)
+                pkgs = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            except Exception:
+                pass
+        elif distro == "fedora" and shutil.which("dnf"):
+            try:
+                result = subprocess.run("dnf --refresh list available | grep -v '^$' | head -n 10", shell=True, capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    name = line.split()[0]
+                    if name and name not in pkgs:
+                        pkgs.append(name)
+            except Exception:
+                pass
+        elif distro == "debian" and shutil.which("apt"):
+            try:
+                result = subprocess.run("apt list 2>/dev/null | grep -v '\\[installed' | tail -n +2 | head -n 10", shell=True, capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    name = line.split("/")[0]
+                    if name and name not in pkgs:
+                        pkgs.append(name)
+            except Exception:
+                pass
+        elif distro == "opensuse" and shutil.which("zypper"):
+            try:
+                result = subprocess.run("zypper se --sort-by-date | grep '^i' | head -n 10", shell=True, capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    parts = line.split("|")
+                    if len(parts) > 2:
+                        name = parts[2].strip()
+                        if name and name not in pkgs:
+                            pkgs.append(name)
+            except Exception:
+                pass
+        return pkgs
+
+    # Interesting packages by category
+    interesting_categories = {
+        "Editors": ["micro", "vim", "neovim", "helix", "kate", "zed"],
+        "Browsers": ["firefox", "brave", "chromium", "librewolf", "vivaldi"],
+        "Gaming": ["steam", "lutris", "heroic-games-launcher", "bottles", "prismlauncher"],
+        "Security": ["ufw", "fail2ban", "clamav", "gufw", "rkhunter"],
+        "Productivity": ["obsidian", "zotero", "onlyoffice", "libreoffice", "notion-app"],
+        "Media": ["vlc", "mpv", "gimp", "inkscape", "kdenlive", "audacity"],
+        "System tools": ["htop", "btop", "fastfetch", "ncdu", "gparted", "timeshift"],
+        "Cloud/DevOps": ["docker", "podman", "distrobox", "kubectl", "terraform", "ansible"],
+    }
+
+    # Recommended repos by distro
+    recommended_repos = []
+    if distro == "arch":
+        recommended_repos = [
+            ("Chaotic-AUR", "https://aur.chaotic.cx/", "Huge prebuilt AUR repo"),
+            ("BlackArch", "https://blackarch.org/", "Penetration testing repo"),
+        ]
+    elif distro == "fedora":
+        recommended_repos = [
+            ("RPM Fusion Free/Nonfree", "https://rpmfusion.org/", "Multimedia, codecs, drivers"),
+            ("Terra", "https://terra.fyralabs.com/", "Modern repo with new packages"),
+            ("COPR", "https://copr.fedorainfracloud.org/", "Third-party/experimental packages"),
+        ]
+    elif distro == "debian":
+        recommended_repos = [
+            ("Debian Backports", "https://backports.debian.org/", "Newer package versions"),
+            ("Debian Multimedia", "https://www.deb-multimedia.org/", "Codecs, multimedia"),
+            ("Google Chrome repo", "https://dl.google.com/linux/chrome/deb/", "Official Chrome"),
+        ]
+    elif distro == "opensuse":
+        recommended_repos = [
+            ("Packman", "https://packman.links2linux.org/", "Codecs, multimedia, games"),
+            ("openSUSE Tumbleweed", "https://en.opensuse.org/Portal:Tumbleweed", "Rolling release repo"),
+        ]
+
+    # --- Browse repo categories (fetch from official repo websites) ---
+    def browse_repo_categories():
+        print(f"\n{colors.BWhite}★ Browse repository categories:{colors.NC}")
+
+        # Helper to get categories for each repo
+        def get_repo_categories():
+            categories = {}
+            # APT
+            if shutil.which('apt'):
+                try:
+                    cmd = "apt-cache show $(apt-cache pkgnames) | grep '^Section: ' | sort -u | cut -d' ' -f2"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        categories['apt'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
+                except Exception:
+                    pass
+            # DNF
+            if shutil.which('dnf'):
+                try:
+                    cmd = "dnf group list"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        groups = []
+                        for line in result.stdout.splitlines():
+                            if line.strip() and not line.startswith(' '):
+                                groups.append(line.strip())
+                        categories['dnf'] = groups
+                except Exception:
+                    pass
+            # Pacman
+            if shutil.which('pacman'):
+                try:
+                    cmd = "pacman -Sg"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        categories['pacman'] = list(sorted(set(line.split()[0] for line in result.stdout.splitlines())))
+                except Exception:
+                    pass
+            # Zypper
+            if shutil.which('zypper'):
+                try:
+                    cmd = "zypper -q groups"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        categories['zypper'] = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                except Exception:
+                    pass
+            # Flatpak
+            if shutil.which('flatpak'):
+                try:
+                    cmd = "flatpak search --columns=category | sort -u"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        categories['flatpak'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
+                except Exception:
+                    pass
+            return categories
+
+        # Helper to get packages in a category for a repo
+        def get_packages_in_category(category, repo):
+            packages = []
+            if repo == 'apt':
+                cmd = f"apt-cache search . | grep '^[^:]*: Section: {category}'"
+                try:
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        packages = [line.split(':')[0] for line in result.stdout.splitlines()]
+                except Exception:
+                    pass
+            elif repo == 'dnf':
+                try:
+                    group_list = subprocess.run("dnf group list -v", shell=True, capture_output=True, text=True)
+                    group_id = None
+                    for line in group_list.stdout.splitlines():
+                        # Example: "  games                       Games and Entertainment                            no"
+                        parts = line.strip().split(None, 1)
+                        if len(parts) == 2 and category.lower() in parts[1].lower():
+                            group_id = parts[0]
+                            break
+                    if not group_id:
+                        group_id = category
+                except Exception:
+                    group_id = category
+
+                # Try both --id and --name for group info
+                found_pkgs = []
+                for group_flag in ["--id", "--name"]:
+                    cmd = f"dnf group info {group_flag} '{group_id}'"
+                    try:
+                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                        if result.returncode == 0 and result.stdout:
+                            in_packages = False
+                            for line in result.stdout.splitlines():
+                                if any(header in line for header in ["Mandatory Packages:", "Default Packages:", "Optional Packages:"]):
+                                    in_packages = True
+                                    continue
+                                if in_packages:
+                                    if not line.strip():
+                                        break
+                                    pkg = line.strip().lstrip("*").strip()
+                                    if pkg:
+                                        found_pkgs.append(pkg)
+                            if found_pkgs:
+                                break  # Stop if we found packages
+                    except Exception:
+                        continue
+                packages.extend(found_pkgs)
+            elif repo == 'pacman':
+                cmd = f"pacman -Sg {category}"
+                try:
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        packages = [line.split()[1] for line in result.stdout.splitlines()]
+                except Exception:
+                    pass
+            elif repo == 'zypper':
+                cmd = f"zypper -q search --type pattern {category}"
+                try:
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        packages = [line.split('|')[1].strip() for line in result.stdout.splitlines() if '|' in line]
+                except Exception:
+                    pass
+            elif repo == 'flatpak':
+                cmd = f"flatpak search --columns=application,category | grep -i {category}"
+                try:
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        packages = [line.split()[0] for line in result.stdout.splitlines()]
+                except Exception:
+                    pass
+            return packages
+
+        categories = get_repo_categories()
+        if not categories:
+            print(f"{colors.BRed}No supported package manager with categories found on this system.{colors.NC}")
+            return
+
+        # Show all repos and categories
+        repo_list = list(categories.keys())
+        for idx, repo in enumerate(repo_list):
+            print(f"{colors.BCyan}[{idx}]{colors.NC} {repo} ({len(categories[repo])} categories)")
+
+        try:
+            selected_repo = input(f"\n{colors.BYellow}Select a repository to browse categories [0-{len(repo_list)-1}] (Enter to cancel): {colors.NC}").strip()
+            if not selected_repo:
+                return
+            repo_idx = int(selected_repo)
+            repo = repo_list[repo_idx]
+        except Exception:
+            print(f"{colors.BRed}Invalid selection.{colors.NC}")
+            return
+
+        cat_list = categories[repo]
+        for idx, cat in enumerate(cat_list):
+            print(f"{colors.BPurple}[{idx}]{colors.NC} {cat}")
+
+        try:
+            selected_cat = input(f"\n{colors.BYellow}Select a category to list packages [0-{len(cat_list)-1}] (Enter to cancel): {colors.NC}").strip()
+            if not selected_cat:
+                return
+            cat_idx = int(selected_cat)
+            category = cat_list[cat_idx]
+        except Exception:
+            print(f"{colors.BRed}Invalid selection.{colors.NC}")
+            return
+
+        print(f"\n{colors.BWhite}Packages in category '{category}' ({repo}):{colors.NC}")
+        pkgs = get_packages_in_category(category, repo)
+        if pkgs:
+            for i, pkg in enumerate(pkgs):
+                print(f"{colors.BGreen}[{i}] {pkg}{colors.NC}")
+        else:
+            print(f"{colors.BYellow}No packages found in this category.{colors.NC}")
+
+    # --- Browse collections ---
+    def browse_collections():
+        print(f"\n{colors.BWhite}★ Browse collections (predefined package lists):{colors.NC}")
+        for idx, (col, pkgs) in enumerate(collections.items()):
+            print(f"{colors.BCyan}[{idx}]{colors.NC} {col} ({len(pkgs)} packages)")
+
+        try:
+            selected = input(f"\n{colors.BYellow}Select a collection to show packages [0-{len(collections)-1}] (Enter to cancel): {colors.NC}").strip()
+            if not selected:
+                return
+            idx = int(selected)
+            col = list(collections.keys())[idx]
+        except Exception:
+            print(f"{colors.BRed}Invalid selection.{colors.NC}")
+            return
+
+        print(f"\n{colors.BWhite}Packages in collection {col}:{colors.NC}")
+        for i, pkg in enumerate(collections[col]):
+            print(f"{colors.BGreen}[{i}] {pkg}{colors.NC}")
+
+        # Show info for selected package
+        selected = input(f"\n{colors.BYellow}Show info for which package? [0-{len(collections[col])-1}] (Enter to skip): {colors.NC}").strip()
+        if selected.isdigit():
+            idx = int(selected)
+            if 0 <= idx < len(collections[col]):
+                pkg_name = collections[col][idx]
+                class DummyArgs:
+                    def __init__(self, package):
+                        self.package = package
+                        self.info = True
+                        self.status = False
+                        self.update = False
+                        self.hold = False
+                        self.unhold = False
+                        self.repo = False
+                print(f"\n{colors.BWhite}★ Package info for {colors.BGreen}{pkg_name}{colors.NC}{colors.BWhite}:{colors.NC}")
+                print(f"{colors.BCyan}To install: {colors.BGreen}better-pkg install {pkg_name}{colors.NC}")
+                print(f"{colors.BPurple}{'─'*50}{colors.NC}")
+                handle_package(DummyArgs(pkg_name))
+                print(f"{colors.BPurple}{'─'*50}{colors.NC}")
+
+    # --- Main sections ---
+    print(f"\n{colors.BWhite}★ Featured packages:{colors.NC}")
+    for name, desc in featured_packages:
+        print(f"{colors.BGreen}  • {name}{colors.NC} - {desc}")
+
+    print(f"\n{colors.BWhite}★ New/updated packages from repositories:{colors.NC}")
+    new_pkgs = get_new_updated_repo_packages()
+    if new_pkgs:
+        for pkg in new_pkgs:
+            print(f"{colors.BYellow}  • {pkg}{colors.NC}")
+    else:
+        print(f"{colors.BYellow}  (Cannot detect automatically){colors.NC}")
+
+    print(f"\n{colors.BWhite}★ Interesting packages by category:{colors.NC}")
+    for cat, pkgs in interesting_categories.items():
+        print(f"{colors.BPurple}  {cat}:{colors.NC} {', '.join(pkgs)}")
+
+    print(f"\n{colors.BWhite}★ Recommended repositories for {distro.capitalize()}:{colors.NC}")
+    if recommended_repos:
+        for name, url, desc in recommended_repos:
+            print(f"{colors.BCyan}  • {name}{colors.NC} - {desc} ({colors.BYellow}{url}{colors.NC})")
+    else:
+        print(f"{colors.BYellow}  (No recommended repositories for this system){colors.NC}")
+
+    # --- Interactive menu for browsing categories and collections ---
+    print(f"\n{colors.BWhite}★ More options:{colors.NC}")
+    print(f"{colors.BCyan}[1]{colors.NC} Browse repository categories")
+    print(f"{colors.BCyan}[2]{colors.NC} Browse collections (predefined package lists)")
+    print(f"{colors.BCyan}[Enter]{colors.NC} Exit")
+
+    choice = input(f"\n{colors.BYellow}Enter your choice: {colors.NC}").strip()
+    if choice == "1":
+        browse_repo_categories()
+    elif choice == "2":
+        browse_collections()
+    else:
+        print(f"{colors.BCyan}Tip:{colors.NC} To install a package, use: {colors.BGreen}better-pkg install <package>{colors.NC}")
+
+
+def handle_check(args):
+    colors = Colors()
+
+    if "mirrors" in args.check:
+        print(f"{colors.BCyan}🔍 Checking mirrors...{colors.NC}")
+
+        if shutil.which("reflector"):
+            if not args.y:
+                confirm = input(f"{colors.BYellow}Do you want to refresh mirrors? (y/N) {colors.NC}").strip().lower()
+                if not confirm.startswith('y'):
+                    sys.exit(1)
+            print(f"{colors.BCyan}[INFO]{colors.NC} Optimizing mirrors...")
+            subprocess.run(["sudo", "reflector", "--latest", "10", "--sort", "rate", "--save", "/etc/pacman.d/mirrorlist"], check=True)
+            print(f"{colors.BGreen}[DONE]{colors.NC} Mirrorlist updated.")
+        elif shutil.which("apt"):
+            if not args.y:
+                confirm = input(f"{colors.BYellow}Do you want to refresh mirrors? (y/N) {colors.NC}").strip().lower()
+                if not confirm.startswith('y'):
+                    sys.exit(1)
+            print(f"{colors.BCyan}[INFO]{colors.NC} Optimizing mirrors...")
+            subprocess.run(["sudo", "apt", "update"], check=True)
+            print(f"{colors.BGreen}[DONE]{colors.NC} Mirrorlist updated.")
+        else:
+            if shutil.which("pacman"):
+                print(f"{colors.BCyan}[INFO]{colors.NC} Reflector is not installed, please install it.")
+            else:
+                print(f"{colors.BRed}[ERROR]{colors.NC} Mirror optimization is not supported on this distro.")
+
+    elif "security" in args.check:
+        def interactive_security_setup():
+            print("")
+            print(f"{colors.BCyan}[*]{colors.NC} Interactive security setup:")
+            print("")
+
+            def prompt_enable(service_name, enable_command):
+                response = input(f"Do you want to enable {service_name}? [y/N]: ").strip().lower()
+                if response == "y":
+                    try:
+                        subprocess.run(enable_command, shell=True, check=True)
+                        print(f"{colors.BGreen}✔ {service_name} enabled.{colors.NC}")
+                    except subprocess.CalledProcessError:
+                        print(f"{colors.BRed}✖ Failed to enable {service_name}.{colors.NC}")
+                else:
+                    print(f"{colors.BYellow}↪ Skipped: {service_name}{colors.NC}")
+
+            if shutil.which("ufw"):
+                prompt_enable("UFW", "sudo ufw enable")
+
+            if shutil.which("firewall-cmd"):
+                prompt_enable("firewalld", "sudo systemctl enable --now firewalld")
+
+            if shutil.which("fail2ban-client"):
+                prompt_enable("fail2ban", "sudo systemctl enable --now fail2ban")
+
+            if shutil.which("auditctl"):
+                prompt_enable("auditd", "sudo systemctl enable --now auditd")
+
+            if shutil.which("aa-status"):
+                print("For AppArmor, run: sudo systemctl enable --now apparmor")
+
+            if shutil.which("sestatus"):
+                print("Set SELinux mode in /etc/selinux/config (enforcing recommended).")
+
+            print(f"{colors.BCyan}[*]{colors.NC} Interactive security setup finished.")
+
+        info = {}
+        rec = []
+        running = []
+
+        def service_status(service):
+            try:
+                result = subprocess.run(["systemctl", "is-active", service], capture_output=True, text=True)
+                return result.stdout.strip()
+            except Exception:
+                return "unknown"
+            
+        # Malicious plugins
+        def check_malicious_plugins():
+            plugins_dir = os.path.expanduser("~/.local/share/better-tools/plugins/")
+            malicious_found = []
+
+            # Here add known malicious plugin names or patterns
+            known_malicious = [
+            "rm_rf.py", "virus.py", "malware.py", "keylogger.py", "stealer.py", "trojan.py"
+            ]
+            
+            if os.path.isdir(plugins_dir):
+                for fname in os.listdir(plugins_dir):
+                    if fname in known_malicious:
+                        malicious_found.append(fname)
+                    else:
+                        # Simple heuristic: check for dangerous commands in plugin source
+                        try:
+                            with open(os.path.join(plugins_dir, fname), "r", encoding="utf-8") as f:
+                                content = f.read()
+                            if any(cmd in content for cmd in ["os.system('rm -rf", "subprocess.run(['rm", "shutil.rmtree('/')", "import socket", "import requests", "open('/dev/input", "keylogger"]):                                    malicious_found.append(fname)
+                        except Exception:
+                                continue
+            return malicious_found
+
+        # UFW
+        if shutil.which("ufw"):
+            try:
+                ufw_status = subprocess.run(["sudo", "ufw", "status"], capture_output=True, text=True, check=True)
+                info["ufw"] = "active" if "Status: active" in ufw_status.stdout else "inactive"
+                if info["ufw"] == "active":
+                    running.append("UFW firewall is enabled and running.")
+                else:
+                    rec.append("Enable UFW firewall for system protection.")
+            except:
+                info["ufw"] = "error"
+                rec.append("Error while checking UFW status (maybe missing root access).")
+        else:
+            if not shutil.which("firewall-cmd"):
+                rec.append("Install UFW firewall for system protection.")
+            info["ufw"] = "not installed"
+
+        # firewalld
+        if shutil.which("firewall-cmd"):
+            firewalld_status = service_status("firewalld")
+            info["firewalld"] = firewalld_status
+            if firewalld_status == "active":
+                running.append("firewalld is enabled and running.")
+            else:
+                rec.append("Enable firewalld to protect against unauthorized network access.")
+        else:
+            if not shutil.which("ufw"):
+                rec.append("Install firewalld for firewall protection.")
+            info["firewalld"] = "not installed"
+
+        # AppArmor
+        if shutil.which("aa-status"):
+            try:
+                aa_status = subprocess.run(["aa-status"], capture_output=True, text=True)
+                if "profiles are in enforce mode" in aa_status.stdout:
+                    info["apparmor"] = "enabled"
+                    running.append("AppArmor is enabled and enforcing.")
+                else:
+                    rec.append("Enable AppArmor to enhance security.")
+                    info["apparmor"] = "disabled"
+            except:
+                info["apparmor"] = "error"
+        else:
+            info["apparmor"] = "not installed"
+
+        # fail2ban
+        if shutil.which("fail2ban-client"):
+            status = service_status("fail2ban")
+            info["fail2ban"] = status
+            if status == "active":
+                running.append("fail2ban is enabled and running.")
+            else:
+                rec.append("Enable fail2ban to protect against brute-force attacks.")
+        else:
+            info["fail2ban"] = "not installed"
+            rec.append("Install fail2ban for SSH and service brute-force protection.")
+
+        # auditd
+        if shutil.which("auditctl"):
+            status = service_status("auditd")
+            info["auditd"] = status
+            if status == "active":
+                running.append("auditd is enabled and running.")
+            else:
+                rec.append("Enable auditd to track system events.")
+        else:
+            info["auditd"] = "not installed"
+            rec.append("Install auditd for security auditing.")
+
+        # SSH settings
+        ssh_info = {}
+        if shutil.which("sshd"):
+            sshd_status = service_status("sshd")
+            ssh_info["status"] = sshd_status
+            if sshd_status == "active":
+                running.append("SSH server is running.")
+            try:
+                with open("/etc/ssh/sshd_config", "r") as f:
+                    config = f.read()
+
+                permit_root = re.search(r"^PermitRootLogin\s+(.*)", config, re.M)
+                protocol = re.search(r"^Protocol\s+(\d+)", config, re.M)
+
+                if permit_root and permit_root.group(1).strip().lower() != "no":
+                    ssh_info["PermitRootLogin"] = permit_root.group(1).strip()
+                    rec.append("Disable root login via SSH (PermitRootLogin no).")
+                else:
+                    ssh_info["PermitRootLogin"] = "no"
+                    running.append("SSH root login is disabled.")
+
+                if protocol and protocol.group(1) != "2":
+                    ssh_info["Protocol"] = protocol.group(1)
+                    rec.append("Use only SSH protocol 2.")
+                else:
+                    ssh_info["Protocol"] = "2"
+                    running.append("SSH protocol 2 is enforced.")
+
+            except Exception as e:
+                ssh_info["error"] = f"Could not read sshd_config: {e}"
+        else:
+            ssh_info["status"] = "not installed"
+            rec.append("Install and configure SSH server securely.")
+
+        info["ssh"] = ssh_info
+
+        # SELinux
+        if shutil.which("sestatus"):
+            try:
+                selinux_status = subprocess.run(["sestatus"], capture_output=True, text=True)
+                if "SELinux status" in selinux_status.stdout:
+                    selinux_mode = "enforcing" if "enforcing" in selinux_status.stdout else "permissive"
+                    info["selinux"] = {"status": "enabled", "mode": selinux_mode}
+                    if selinux_mode == "enforcing":
+                        running.append("SELinux is enabled and enforcing.")
+                    else:
+                        rec.append("Set SELinux to enforcing mode for better security.")
+                else:
+                    info["selinux"] = {"status": "not enabled"}
+                    rec.append("Enable SELinux for additional security.")
+            except Exception:
+                info["selinux"] = {"status": "error"}
+        else:
+            info["selinux"] = {"status": "not installed"}
+            rec.append("Consider installing and configuring SELinux for additional security.")
+
+        # Password policy
+        passwd_info = {}
+        try:
+            with open("/etc/login.defs", "r") as f:
+                config = f.read()
+
+            # Check for minimum password length
+            minlen = re.search(r"^PASS_MIN_LEN\s+(\d+)", config, re.M)
+            if minlen and int(minlen.group(1)) >= 12:
+                passwd_info["PASS_MIN_LEN"] = minlen.group(1)
+                running.append("Password minimum length is set to 12 or more.")
+            else:
+                passwd_info["PASS_MIN_LEN"] = minlen.group(1) if minlen else "not set"
+                rec.append("Set a minimum password length of 12 or more.")
+
+            # Check for password complexity
+            if "PASS_WARN_AGE" in config:
+                passwd_info["PASS_WARN_AGE"] = "configured"
+                running.append("Password expiration policy is configured.")
+            else:
+                rec.append("Configure password expiration policy.")
+
+            info["passwd_policy"] = passwd_info
+
+        except Exception:
+            info["passwd_policy"] = {"status": "error"}
+
+        # Audit sudoers
+        sudoers_info = {}
+        try:
+            # Try to open sudoers file with root permission using sudo
+            result = subprocess.run(
+                ["sudo", "cat", "/etc/sudoers"], capture_output=True, text=True, check=True
+            )
+            config = result.stdout
+
+            # Check if sudoers allows root access
+            if "root ALL=(ALL) ALL" in config:
+                sudoers_info["root_access"] = "enabled"
+                rec.append("Restrict root access via sudo.")
+            else:
+                sudoers_info["root_access"] = "restricted"
+                running.append("Root access via sudo is restricted.")
+
+            info["sudoers"] = sudoers_info
+        except subprocess.CalledProcessError as e:
+            rec.append("Error while checking sudoers file (maybe missing root access).")
+            info["sudoers"] = {"status": "error", "error": str(e)}
+
+        # Flatpak Permissions
+        flatpak_info = {}
+        if shutil.which("flatpak"):
+            try:
+                flatpak_apps = subprocess.run(["flatpak", "list", "--app"], capture_output=True, text=True, check=True)
+                flatpak_info["installed_apps"] = flatpak_apps.stdout.strip().splitlines()
+                running.append("Flatpak is installed for containerized apps.")
+            except subprocess.CalledProcessError as e:
+                flatpak_info["error"] = f"Error retrieving flatpak apps: {e}"
+        else:
+            flatpak_info["status"] = "not installed"
+            rec.append("Install flatpak for managing containerized apps securely.")
+
+        info["flatpak"] = flatpak_info
+
+        # Flatpak alternatives for installed apps and rpm-ostree layered packages
+        flatpak_alternatives = []
+
+        # 1. Get user-installed system packages (apt/dnf/pacman/zypper)
+        installed_pkgs = set()
+        if shutil.which("apt"):
+            try:
+                result = subprocess.run("apt-mark showmanual", shell=True, capture_output=True, text=True)
+                installed_pkgs.update([line.strip() for line in result.stdout.splitlines() if line.strip()])
+            except Exception:
+                pass
+        if shutil.which("dnf"):
+            try:
+                result = subprocess.run("dnf history userinstalled", shell=True, capture_output=True, text=True)
+                installed_pkgs.update([line.split('.')[0].strip() for line in result.stdout.splitlines() if line.strip()])
+            except Exception:
+                pass
+        if shutil.which("pacman"):
+            try:
+                result = subprocess.run("pacman -Qe", shell=True, capture_output=True, text=True)
+                installed_pkgs.update([line.split()[0].strip() for line in result.stdout.splitlines() if line.strip()])
+            except Exception:
+                pass
+        if shutil.which("zypper"):
+            try:
+                result = subprocess.run("zypper search --installed-only", shell=True, capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    parts = line.split('|')
+                    if len(parts) > 2:
+                        pkg_name = parts[2].strip()
+                        installed_pkgs.add(pkg_name)
+            except Exception:
+                pass
+
+        # 2. Add rpm-ostree layered packages if present
+        rpm_ostree_layered = set()
+        if shutil.which("rpm-ostree"):
+            try:
+                result = subprocess.run("rpm-ostree status", shell=True, capture_output=True, text=True)
+                output = result.stdout
+                # Parse LayeredPackages from deployments
+                deployments = []
+                current = None
+                in_deployments = False
+                for line in output.splitlines():
+                    if line.strip().startswith("Deployments:"):
+                        in_deployments = True
+                        continue
+                    if not in_deployments:
+                        continue
+                    if line.strip().startswith("●") or (line and not line.startswith(" ")):
+                        if current:
+                            deployments.append(current)
+                        title = line.strip().lstrip("●").strip()
+                        current = {
+                            "title": title,
+                            "fields": {},
+                            "LayeredPackages": []
+                        }
+                    elif current is not None:
+                        if "LayeredPackages:" in line:
+                            pkgs = line.split("LayeredPackages:")[-1].strip()
+                            if pkgs:
+                                current["LayeredPackages"] = pkgs.split()
+                        elif ":" in line:
+                            key, val = line.split(":", 1)
+                            current["fields"][key.strip()] = val.strip()
+                if current:
+                    deployments.append(current)
+                # Collect all LayeredPackages from all deployments
+                for dep in deployments:
+                    for pkg in dep.get("LayeredPackages", []):
+                        rpm_ostree_layered.add(pkg)
+            except Exception:
+                pass
+
+        # Merge rpm-ostree layered packages into installed_pkgs for flatpak alternative search
+        installed_pkgs.update(rpm_ostree_layered)
+
+        # 3. For each installed package, search for a flatpak alternative
+        if shutil.which("flatpak"):
+            for pkg in sorted(installed_pkgs):
+                try:
+                    search_cmd = ["flatpak", "search", "--columns=application,name", pkg]
+                    result = subprocess.run(search_cmd, capture_output=True, text=True)
+                    for line in result.stdout.splitlines()[1:]:
+                        if not line.strip():
+                            continue
+                        # Defensive: handle lines with only app_id or missing name
+                        parts = line.split(maxsplit=1)
+                        if len(parts) == 2:
+                            app_id, app_name = parts
+                        else:
+                            app_id, app_name = parts[0], ""
+                        # Only suggest if not already installed as flatpak
+                        if app_id not in flatpak_info.get("installed_apps", []):
+                            flatpak_alternatives.append((pkg, app_id, app_name))
+                except Exception:
+                    continue
+
+        info["flatpak_alternatives"] = flatpak_alternatives
+
+        # Output
+        info["recommendations"] = rec
+        info["active_security"] = running
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            print(f"{colors.BYellow}[INFO]{colors.NC} Checking system security...")
+
+            malicious_plugins = check_malicious_plugins()
+            if malicious_plugins:
+                print(f"{colors.BRed}⚠️ Warning: Potentially malicious plugins detected!{colors.NC}")
+                for plugin in malicious_plugins:
+                    print(f"{colors.BRed}  • {plugin}{colors.NC}")
+                print("")
+                print(f"{colors.BYellow}It is strongly recommended to remove these plugins from ~/.local/share/better-tools/plugins/{colors.NC}\n")
+
+            # Print Flatpak alternatives section before recommendations
+            if flatpak_alternatives:
+                print(f"\n{colors.BPurple}[FLATPAK SUGGESTIONS]{colors.NC} (Flatpak alternatives for installed apps)")
+                for pkg, app_id, app_name in flatpak_alternatives:
+                    print(f"  - {pkg} → {app_id} ({app_name})")
+            else:
+                print(f"\n{colors.BPurple}[FLATPAK SUGGESTIONS]{colors.NC} No Flatpak alternatives found for installed apps.")
+
+            if rec:
+                print(f"\n{colors.BYellow}[RECOMMENDATIONS]{colors.NC}")
+                for r in rec:
+                    print(f"  - {r}")
+            else:
+                print(f"{colors.BGreen}✔ System security looks good.{colors.NC}")
+
+            if running:
+                print(f"\n{colors.BGreen}[ACTIVE]{colors.NC} (Enabled & Running)")
+                for r in running:
+                    print(f"  - {r}")
+
+        if getattr(args, "set", False):
+            interactive_security_setup()
+
+    elif "pacman" in args.check:
+        print(f"{colors.BCyan}🔍 Checking Pacman database...{colors.NC}")
+        if shutil.which("pacman"):
+            if os.path.exists("/var/lib/pacman/db.lck"):
+                print(f"{colors.BCyan}[INFO]{colors.NC} Removing pacman .db lock...")
+                subprocess.run(["sudo", "rm", "-f", "/var/lib/pacman/db.lck"], check=False)
+                print(f"{colors.BGreen}[DONE]{colors.NC} pacman .db lock removed.")
+            else:
+                print(f"{colors.BGreen}[DONE]{colors.NC} No pacman .db lock found.")
+        else:
+            print(f"{colors.BRed}[ERROR]{colors.NC} Pacman check is supported only on Arch Linux.")
+
+
+def version(args):
+    colors = Colors()
+    print(f"{colors.BCyan}📦 better-pkg version 1.2-Stable was made by Vlastimil Dědek <dedek.vlastimil2@proton.me> (part of better-tools){colors.NC}")
+
+def main():
+    # Normalizujeme argumenty před parsováním
+    normalized_args = convert_shortcut(sys.argv[1:])
+
+    command_handlers = {
+        'update': handle_update,
+        'upgrade': handle_upgrade,
+        'cleanup': handle_cleanup,
+        'repair': handle_repair,
+        'list': handle_list,
+        'setup': handle_setup,
+        'search': search,
+        'install': install,
+        'remove': remove,
+        'cache': handle_cache,
+        "setup-custom": setup_custom,
+        "setup-remove": setup_remove,
+        "setup-export": setup_export,
+        "package": handle_package,
+        "discover": handle_discover,
+        "check": handle_check,
+        "version": version,
+    }
+
+    load_plugins(command_handlers, HOOKS, SETUP_FUNCTIONS, PACKAGE_GROUPS_EXTENSIONS, CUSTOM_JSON_HANDLERS)
+
+    for name, func, _ in PLUGIN_COMMANDS:
+        command_handlers[name] = func
+
+    # Parsujeme normalizované argumenty
+    parser = setup_argparse()
+    try:
+        args = parser.parse_args(normalized_args)
+    except argparse.ArgumentError as e:
+        print(f"Error: {e}")
+        parser.print_help()
+        sys.exit(1)
+
+    if args.command == None:
+        parser.print_help()
+        sys.exit(1)
+
+    command_handlers[args.command](args)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
