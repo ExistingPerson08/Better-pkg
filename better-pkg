@@ -4330,7 +4330,7 @@ def handle_check(args):
 
 def version(args):
     colors = Colors()
-    print(f"{colors.BCyan}📦 better-pkg version 1.2-Stable was made by Vlastimil Dědek <dedek.vlastimil2@proton.me> (part of better-tools){colors.NC}")
+    print(f"{colors.BCyan}📦 better-pkg version 1.2-Beta was made by Vlastimil Dědek <dedek.vlastimil2@proton.me>{colors.NC}")
 
 def main():
     # Normalizujeme argumenty před parsováním
