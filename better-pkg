@@ -160,6 +160,7 @@ def setup_argparse():
     install_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
     install_parser.add_argument('-g', '--fetch', action='store_true', help='Fetch package from official source.')
     install_parser.add_argument('-c', '--plugin', action='store_true', help='Install better-pkg plugin.')
+    install_parser.add_argument('-s', '--sclassic', action='store_true', help='Use snap --classic.')
     install_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
     install_parser.add_argument('package', nargs='+', help='Package(s) to install')
 
@@ -3006,6 +3007,21 @@ def install(args):
             else:
                 print(f"{colors.BRed}Could not fetch {package} from official source. {colors.NC}")
         return
+    
+    # Snap --classic support
+    if args.sclassic:
+        for package in expanded_packages:
+            if shutil.which("snap"):
+                print(f"{colors.BCyan}Installing {package} with snap --classic...{colors.NC}")
+                try:
+                    subprocess.run(["sudo", "snap", "install", package, "--classic"], check=True)
+                    print(f"{colors.BGreen}Successfully installed {package} with snap --classic.{colors.NC}")
+                except subprocess.CalledProcessError as e:
+                    print(f"{colors.BRed}Failed to install {package} with snap --classic: {e}{colors.NC}")
+            else:
+                print(f"{colors.BRed}Snap is not installed on this system.{colors.NC}")
+        return
+
     
     if args.plugin:
         import urllib.request
