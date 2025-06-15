@@ -234,6 +234,13 @@ def setup_argparse():
     #Discover commands
     discover_parser = subparsers.add_parser('discover', help='Discover new packages')
 
+    #Add repositories command
+    add_repo_parser = subparsers.add_parser('add-repo', help='Add repository')
+    add_repo_parser.add_argument('-c', '--choose', action='store_true', help='Choose repository from list')
+    add_repo_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+    add_repo_parser.add_argument('repo', help='Repository to add')
+
+
     #Check commands
     check_parser = subparsers.add_parser('check', help='Check (and refresh) packages, services and repositories')
     check_parser.add_argument('check', nargs='+', help='Choose what to check.')
@@ -3545,6 +3552,106 @@ def handle_package(args):
 
     print(f"{colors.BRed}❌ Package {package} could not be processed. It may not be installed or supported.{colors.NC}")
 
+def handle_add_repo(args):
+    """
+    Přidá repozitář podle správce balíčků a typu repozitáře.
+    Pokud je args.choose, umožní vybrat doporučené repozitáře.
+    """
+    colors = Colors()
+
+    # Doporučené repozitáře podle distribuce
+    recommended_repos = []
+    if shutil.which("pacman"):
+        recommended_repos = [
+            ("Chaotic-AUR", "https://aur.chaotic.cx/", "Huge prebuilt AUR repo"),
+            ("BlackArch", "https://blackarch.org/", "Penetration testing repo"),
+        ]
+    elif shutil.which("dnf"):
+        recommended_repos = [
+        ]
+    elif shutil.which("apt"):
+        recommended_repos = [
+            ("Debian Backports", "http://deb.debian.org/debian/ bullseye-backports main", "Newer package versions"),
+            ("Debian Multimedia", "http://www.deb-multimedia.org bullseye main non-free", "Codecs, multimedia"),
+            ("Google Chrome repo", "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main", "Official Chrome"),
+        ]
+    elif shutil.which("zypper"):
+        recommended_repos = [
+            ("Packman", "http://packman.inode.at/suse/openSUSE_Tumbleweed/", "Codecs, multimedia, games"),
+            ("openSUSE Tumbleweed", "https://download.opensuse.org/tumbleweed/repo/oss/", "Rolling release repo"),
+        ]
+
+    if args.choose:
+        if shutil.which("dnf"):
+            print(f"{colors.BCyan}There are no recomended repos for Fedora yet.{colors.NC}")
+            return
+        
+        print(f"\n{colors.BWhite}Recommended repositories:{colors.NC}")
+        for idx, (name, url, desc) in enumerate(recommended_repos):
+            print(f"{colors.BCyan}[{idx}]{colors.NC} {name} - {desc} ({colors.BYellow}{url}{colors.NC})")
+        try:
+            selected = input(f"\n{colors.BYellow}Select a repository to add [0-{len(recommended_repos)-1}] (Enter to cancel): {colors.NC}").strip()
+            if not selected:
+                print_status("Operation cancelled.", "warning")
+                return
+            idx = int(selected)
+            repo_url = recommended_repos[idx][1]
+        except Exception:
+            print_status("Invalid selection.", "error")
+            return
+    else:
+        repo_url = args.repo
+
+    # Přidání repozitáře podle správce balíčků
+    if shutil.which("apt"):
+        if repo_url.startswith("ppa:"):
+            # PPA repozitář (Ubuntu)
+            cmd = f"sudo add-apt-repository -y {repo_url}"
+        elif repo_url.startswith("deb "):
+            # Debian-style repozitář
+            cmd = f'echo "{repo_url}" | sudo tee /etc/apt/sources.list.d/custom-repo.list'
+        else:
+            # URL repozitáře, pokus o přidání jako debian repo
+            cmd = f'echo "deb {repo_url}" | sudo tee /etc/apt/sources.list.d/custom-repo.list'
+        print_status(f"Adding repository: {repo_url}", "info")
+        subprocess.run(cmd, shell=True)
+        print_status("Updating package list...", "info")
+        subprocess.run("sudo apt update", shell=True)
+        print_status("Repository added successfully.", "success")
+    elif shutil.which("dnf"):
+        # DNF repo (Fedora)
+        if repo_url.endswith(".repo"):
+            cmd = f"sudo dnf config-manager addrepo --from-repofile={repo_url}"
+        else:
+            # Pokus o přidání repozitáře podle url
+            cmd = f"sudo dnf config-manager addrepo --from-repofile={repo_url}"
+        print_status(f"Adding repository: {repo_url}", "info")
+        subprocess.run(cmd, shell=True)
+        print_status("Repository added successfully.", "success")
+    elif shutil.which("zypper"):
+        # Zypper repo (openSUSE)
+        cmd = f"sudo zypper ar {repo_url} custom-repo"
+        print_status(f"Adding repository: {repo_url}", "info")
+        subprocess.run(cmd, shell=True)
+        print_status("Refreshing repositories...", "info")
+        subprocess.run("sudo zypper refresh", shell=True)
+        print_status("Repository added successfully.", "success")
+    elif shutil.which("pacman"):
+        # Pacman repo (Arch)
+        repo_name = "customrepo"
+        repo_entry = f"\n[{repo_name}]\nServer = {repo_url}\n"
+        conf_path = "/etc/pacman.conf"
+        print_status(f"Adding repository: {repo_url}", "info")
+        try:
+            subprocess.run(f"echo '{repo_entry}' | sudo tee -a {conf_path}", shell=True, check=True)
+            print_status("Repository added to pacman.conf.", "success")
+            subprocess.run("sudo pacman -Sy", shell=True)
+        except Exception as e:
+            print_status(f"Failed to add repository: {e}", "error")
+    else:
+        print_status("No supported package manager found for adding repositories.", "error")
+
+
 def handle_discover(args):
     """
     Něco jako obchod s aplikacemi, ale pro CLI.
@@ -4272,6 +4379,7 @@ def main():
         "package": handle_package,
         "discover": handle_discover,
         "check": handle_check,
+        "add-repo": handle_add_repo,
         "version": version,
         "self-update": self_update,
     }
