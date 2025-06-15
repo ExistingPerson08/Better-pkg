@@ -18,7 +18,7 @@
 
 1. **Requirements:**  
    - Python 3
-   - python-requests
+   - dbus-x11, python-requests and python-distro
    - Recommended: `wget`, `curl`, `sudo`, and your package managers (apt, dnf, pacman, ...)
 
 2. **Download python file from releases**
