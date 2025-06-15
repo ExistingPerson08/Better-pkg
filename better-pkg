@@ -160,6 +160,8 @@ def setup_argparse():
     install_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
     install_parser.add_argument('-g', '--fetch', action='store_true', help='Fetch package from official source.')
     install_parser.add_argument('-c', '--plugin', action='store_true', help='Install better-pkg plugin.')
+    install_parser.add_argument('-s', '--sclassic', action='store_true', help='Use snap --classic.')
+    install_parser.add_argument('-b', '--file', action='store_true', help='Install package from file.')
     install_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
     install_parser.add_argument('package', nargs='+', help='Package(s) to install')
 
@@ -232,6 +234,13 @@ def setup_argparse():
     #Discover commands
     discover_parser = subparsers.add_parser('discover', help='Discover new packages')
 
+    #Add repositories command
+    add_repo_parser = subparsers.add_parser('add-repo', help='Add repository')
+    add_repo_parser.add_argument('-c', '--choose', action='store_true', help='Choose repository from list')
+    add_repo_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+    add_repo_parser.add_argument('repo', help='Repository to add')
+
+
     #Check commands
     check_parser = subparsers.add_parser('check', help='Check (and refresh) packages, services and repositories')
     check_parser.add_argument('check', nargs='+', help='Choose what to check.')
@@ -251,6 +260,9 @@ def setup_argparse():
     package_parser.add_argument('-n', '--unhold', action='store_true', help='Unhold package')
     package_parser.add_argument('-r', '--repo', action='store_true', help='Show from which repository the package is installed')
     package_parser.add_argument('package', help='Package name')
+
+    selfupd_parser = subparsers.add_parser('self-update', help='Update better-pkg itself.')
+    selfupd_parser.add_argument('-b', '--unreleased', action='store_true', help='Update to unreleased (beta, alpha, dev) version if available.')
 
     version_parser = subparsers.add_parser('version', help='Show version.')
 
@@ -2607,7 +2619,7 @@ def search(args):
         'flatpak': colors.c1,
         'snap': colors.c4,
         'brew': colors.c3,
-        'betterpkg': colors.BYellow,
+        'betterpkg': colors.BYellow
     }
 
     # Sloučení a seřazení výsledků podle názvu balíčku
@@ -3004,6 +3016,48 @@ def install(args):
                 print(f"{colors.BRed}Could not fetch {package} from official source. {colors.NC}")
         return
     
+    # Snap --classic support
+    if args.sclassic:
+        for package in expanded_packages:
+            if shutil.which("snap"):
+                print(f"{colors.BCyan}Installing {package} with snap --classic...{colors.NC}")
+                try:
+                    subprocess.run(["sudo", "snap", "install", package, "--classic"], check=True)
+                    print(f"{colors.BGreen}Successfully installed {package} with snap --classic.{colors.NC}")
+                except subprocess.CalledProcessError as e:
+                    print(f"{colors.BRed}Failed to install {package} with snap --classic: {e}{colors.NC}")
+            else:
+                print(f"{colors.BRed}Snap is not installed on this system.{colors.NC}")
+        return
+    
+    # Instalace ze souboru
+    if args.file:
+        for package in expanded_packages:
+            if not os.path.isfile(package):
+                print(f"{colors.BRed}File not found: {package}{colors.NC}")
+                continue
+            if package.endswith(".deb") and shutil.which("apt"):
+                print(f"{colors.BCyan}Installing DEB package with apt/dpkg: {package}{colors.NC}")
+                subprocess.run(["sudo", "dpkg", "-i", package])
+                subprocess.run(["sudo", "apt", "-f", "install", "-y"])
+            elif package.endswith(".rpm") and (shutil.which("dnf") or shutil.which("zypper") or shutil.which("rpm")):
+                print(f"{colors.BCyan}Installing RPM package: {package}{colors.NC}")
+                if shutil.which("dnf"):
+                    subprocess.run(["sudo", "dnf", "install", "-y", package])
+                elif shutil.which("zypper"):
+                    subprocess.run(["sudo", "zypper", "install", "-y", package])
+                else:
+                    subprocess.run(["sudo", "rpm", "-i", package])
+            elif (
+                (package.endswith(".pkg.tar.zst") or package.endswith(".pkg.tar.xz") or package.endswith(".pkg.tar.gz"))
+                and shutil.which("pacman")
+            ):
+                print(f"{colors.BCyan}Installing Pacman package: {package}{colors.NC}")
+                subprocess.run(["sudo", "pacman", "-U", "--noconfirm", package])
+            else:
+                print(f"{colors.BRed}Unknown or unsupported package file type for this system: {package}{colors.NC}")
+        return
+
     if args.plugin:
         import urllib.request
 
@@ -3498,6 +3552,106 @@ def handle_package(args):
 
     print(f"{colors.BRed}❌ Package {package} could not be processed. It may not be installed or supported.{colors.NC}")
 
+def handle_add_repo(args):
+    """
+    Přidá repozitář podle správce balíčků a typu repozitáře.
+    Pokud je args.choose, umožní vybrat doporučené repozitáře.
+    """
+    colors = Colors()
+
+    # Doporučené repozitáře podle distribuce
+    recommended_repos = []
+    if shutil.which("pacman"):
+        recommended_repos = [
+            ("Chaotic-AUR", "https://aur.chaotic.cx/", "Huge prebuilt AUR repo"),
+            ("BlackArch", "https://blackarch.org/", "Penetration testing repo"),
+        ]
+    elif shutil.which("dnf"):
+        recommended_repos = [
+        ]
+    elif shutil.which("apt"):
+        recommended_repos = [
+            ("Debian Backports", "http://deb.debian.org/debian/ bullseye-backports main", "Newer package versions"),
+            ("Debian Multimedia", "http://www.deb-multimedia.org bullseye main non-free", "Codecs, multimedia"),
+            ("Google Chrome repo", "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main", "Official Chrome"),
+        ]
+    elif shutil.which("zypper"):
+        recommended_repos = [
+            ("Packman", "http://packman.inode.at/suse/openSUSE_Tumbleweed/", "Codecs, multimedia, games"),
+            ("openSUSE Tumbleweed", "https://download.opensuse.org/tumbleweed/repo/oss/", "Rolling release repo"),
+        ]
+
+    if args.choose:
+        if shutil.which("dnf"):
+            print(f"{colors.BCyan}There are no recomended repos for Fedora yet.{colors.NC}")
+            return
+        
+        print(f"\n{colors.BWhite}Recommended repositories:{colors.NC}")
+        for idx, (name, url, desc) in enumerate(recommended_repos):
+            print(f"{colors.BCyan}[{idx}]{colors.NC} {name} - {desc} ({colors.BYellow}{url}{colors.NC})")
+        try:
+            selected = input(f"\n{colors.BYellow}Select a repository to add [0-{len(recommended_repos)-1}] (Enter to cancel): {colors.NC}").strip()
+            if not selected:
+                print_status("Operation cancelled.", "warning")
+                return
+            idx = int(selected)
+            repo_url = recommended_repos[idx][1]
+        except Exception:
+            print_status("Invalid selection.", "error")
+            return
+    else:
+        repo_url = args.repo
+
+    # Přidání repozitáře podle správce balíčků
+    if shutil.which("apt"):
+        if repo_url.startswith("ppa:"):
+            # PPA repozitář (Ubuntu)
+            cmd = f"sudo add-apt-repository -y {repo_url}"
+        elif repo_url.startswith("deb "):
+            # Debian-style repozitář
+            cmd = f'echo "{repo_url}" | sudo tee /etc/apt/sources.list.d/custom-repo.list'
+        else:
+            # URL repozitáře, pokus o přidání jako debian repo
+            cmd = f'echo "deb {repo_url}" | sudo tee /etc/apt/sources.list.d/custom-repo.list'
+        print_status(f"Adding repository: {repo_url}", "info")
+        subprocess.run(cmd, shell=True)
+        print_status("Updating package list...", "info")
+        subprocess.run("sudo apt update", shell=True)
+        print_status("Repository added successfully.", "success")
+    elif shutil.which("dnf"):
+        # DNF repo (Fedora)
+        if repo_url.endswith(".repo"):
+            cmd = f"sudo dnf config-manager addrepo --from-repofile={repo_url}"
+        else:
+            # Pokus o přidání repozitáře podle url
+            cmd = f"sudo dnf config-manager addrepo --from-repofile={repo_url}"
+        print_status(f"Adding repository: {repo_url}", "info")
+        subprocess.run(cmd, shell=True)
+        print_status("Repository added successfully.", "success")
+    elif shutil.which("zypper"):
+        # Zypper repo (openSUSE)
+        cmd = f"sudo zypper ar {repo_url} custom-repo"
+        print_status(f"Adding repository: {repo_url}", "info")
+        subprocess.run(cmd, shell=True)
+        print_status("Refreshing repositories...", "info")
+        subprocess.run("sudo zypper refresh", shell=True)
+        print_status("Repository added successfully.", "success")
+    elif shutil.which("pacman"):
+        # Pacman repo (Arch)
+        repo_name = "customrepo"
+        repo_entry = f"\n[{repo_name}]\nServer = {repo_url}\n"
+        conf_path = "/etc/pacman.conf"
+        print_status(f"Adding repository: {repo_url}", "info")
+        try:
+            subprocess.run(f"echo '{repo_entry}' | sudo tee -a {conf_path}", shell=True, check=True)
+            print_status("Repository added to pacman.conf.", "success")
+            subprocess.run("sudo pacman -Sy", shell=True)
+        except Exception as e:
+            print_status(f"Failed to add repository: {e}", "error")
+    else:
+        print_status("No supported package manager found for adding repositories.", "error")
+
+
 def handle_discover(args):
     """
     Něco jako obchod s aplikacemi, ale pro CLI.
@@ -3630,181 +3784,6 @@ def handle_discover(args):
             ("openSUSE Tumbleweed", "https://en.opensuse.org/Portal:Tumbleweed", "Rolling release repo"),
         ]
 
-    # --- Browse repo categories (fetch from official repo websites) ---
-    def browse_repo_categories():
-        print(f"\n{colors.BWhite}★ Browse repository categories:{colors.NC}")
-
-        # Helper to get categories for each repo
-        def get_repo_categories():
-            categories = {}
-            # APT
-            if shutil.which('apt'):
-                try:
-                    cmd = "apt-cache show $(apt-cache pkgnames) | grep '^Section: ' | sort -u | cut -d' ' -f2"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        categories['apt'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
-                except Exception:
-                    pass
-            # DNF
-            if shutil.which('dnf'):
-                try:
-                    cmd = "dnf group list"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        groups = []
-                        for line in result.stdout.splitlines():
-                            if line.strip() and not line.startswith(' '):
-                                groups.append(line.strip())
-                        categories['dnf'] = groups
-                except Exception:
-                    pass
-            # Pacman
-            if shutil.which('pacman'):
-                try:
-                    cmd = "pacman -Sg"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        categories['pacman'] = list(sorted(set(line.split()[0] for line in result.stdout.splitlines())))
-                except Exception:
-                    pass
-            # Zypper
-            if shutil.which('zypper'):
-                try:
-                    cmd = "zypper -q groups"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        categories['zypper'] = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-                except Exception:
-                    pass
-            # Flatpak
-            if shutil.which('flatpak'):
-                try:
-                    cmd = "flatpak search --columns=category | sort -u"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        categories['flatpak'] = [cat.strip() for cat in result.stdout.splitlines() if cat.strip()]
-                except Exception:
-                    pass
-            return categories
-
-        # Helper to get packages in a category for a repo
-        def get_packages_in_category(category, repo):
-            packages = []
-            if repo == 'apt':
-                cmd = f"apt-cache search . | grep '^[^:]*: Section: {category}'"
-                try:
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        packages = [line.split(':')[0] for line in result.stdout.splitlines()]
-                except Exception:
-                    pass
-            elif repo == 'dnf':
-                try:
-                    group_list = subprocess.run("dnf group list -v", shell=True, capture_output=True, text=True)
-                    group_id = None
-                    for line in group_list.stdout.splitlines():
-                        # Example: "  games                       Games and Entertainment                            no"
-                        parts = line.strip().split(None, 1)
-                        if len(parts) == 2 and category.lower() in parts[1].lower():
-                            group_id = parts[0]
-                            break
-                    if not group_id:
-                        group_id = category
-                except Exception:
-                    group_id = category
-
-                # Try both --id and --name for group info
-                found_pkgs = []
-                for group_flag in ["--id", "--name"]:
-                    cmd = f"dnf group info {group_flag} '{group_id}'"
-                    try:
-                        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                        if result.returncode == 0 and result.stdout:
-                            in_packages = False
-                            for line in result.stdout.splitlines():
-                                if any(header in line for header in ["Mandatory Packages:", "Default Packages:", "Optional Packages:"]):
-                                    in_packages = True
-                                    continue
-                                if in_packages:
-                                    if not line.strip():
-                                        break
-                                    pkg = line.strip().lstrip("*").strip()
-                                    if pkg:
-                                        found_pkgs.append(pkg)
-                            if found_pkgs:
-                                break  # Stop if we found packages
-                    except Exception:
-                        continue
-                packages.extend(found_pkgs)
-            elif repo == 'pacman':
-                cmd = f"pacman -Sg {category}"
-                try:
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        packages = [line.split()[1] for line in result.stdout.splitlines()]
-                except Exception:
-                    pass
-            elif repo == 'zypper':
-                cmd = f"zypper -q search --type pattern {category}"
-                try:
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        packages = [line.split('|')[1].strip() for line in result.stdout.splitlines() if '|' in line]
-                except Exception:
-                    pass
-            elif repo == 'flatpak':
-                cmd = f"flatpak search --columns=application,category | grep -i {category}"
-                try:
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                    if result.returncode == 0:
-                        packages = [line.split()[0] for line in result.stdout.splitlines()]
-                except Exception:
-                    pass
-            return packages
-
-        categories = get_repo_categories()
-        if not categories:
-            print(f"{colors.BRed}No supported package manager with categories found on this system.{colors.NC}")
-            return
-
-        # Show all repos and categories
-        repo_list = list(categories.keys())
-        for idx, repo in enumerate(repo_list):
-            print(f"{colors.BCyan}[{idx}]{colors.NC} {repo} ({len(categories[repo])} categories)")
-
-        try:
-            selected_repo = input(f"\n{colors.BYellow}Select a repository to browse categories [0-{len(repo_list)-1}] (Enter to cancel): {colors.NC}").strip()
-            if not selected_repo:
-                return
-            repo_idx = int(selected_repo)
-            repo = repo_list[repo_idx]
-        except Exception:
-            print(f"{colors.BRed}Invalid selection.{colors.NC}")
-            return
-
-        cat_list = categories[repo]
-        for idx, cat in enumerate(cat_list):
-            print(f"{colors.BPurple}[{idx}]{colors.NC} {cat}")
-
-        try:
-            selected_cat = input(f"\n{colors.BYellow}Select a category to list packages [0-{len(cat_list)-1}] (Enter to cancel): {colors.NC}").strip()
-            if not selected_cat:
-                return
-            cat_idx = int(selected_cat)
-            category = cat_list[cat_idx]
-        except Exception:
-            print(f"{colors.BRed}Invalid selection.{colors.NC}")
-            return
-
-        print(f"\n{colors.BWhite}Packages in category '{category}' ({repo}):{colors.NC}")
-        pkgs = get_packages_in_category(category, repo)
-        if pkgs:
-            for i, pkg in enumerate(pkgs):
-                print(f"{colors.BGreen}[{i}] {pkg}{colors.NC}")
-        else:
-            print(f"{colors.BYellow}No packages found in this category.{colors.NC}")
-
     # --- Browse collections ---
     def browse_collections():
         print(f"\n{colors.BWhite}★ Browse collections (predefined package lists):{colors.NC}")
@@ -3872,14 +3851,11 @@ def handle_discover(args):
 
     # --- Interactive menu for browsing categories and collections ---
     print(f"\n{colors.BWhite}★ More options:{colors.NC}")
-    print(f"{colors.BCyan}[1]{colors.NC} Browse repository categories")
-    print(f"{colors.BCyan}[2]{colors.NC} Browse collections (predefined package lists)")
+    print(f"{colors.BCyan}[1]{colors.NC} Browse collections")
     print(f"{colors.BCyan}[Enter]{colors.NC} Exit")
 
     choice = input(f"\n{colors.BYellow}Enter your choice: {colors.NC}").strip()
     if choice == "1":
-        browse_repo_categories()
-    elif choice == "2":
         browse_collections()
     else:
         print(f"{colors.BCyan}Tip:{colors.NC} To install a package, use: {colors.BGreen}better-pkg install <package>{colors.NC}")
@@ -4327,10 +4303,60 @@ def handle_check(args):
         else:
             print(f"{colors.BRed}[ERROR]{colors.NC} Pacman check is supported only on Arch Linux.")
 
+def self_update(args):
+    """
+    Aktualizuje better-pkg na poslední verzi z GitHub Releases.
+    Přidána možnost aktualizace na nevydané (pre-release, beta, dev) verze pomocí --unreleased.
+    """
+    colors = Colors()
+    api_url = "https://api.github.com/repos/ExistingPerson08/better-pkg/releases"
+    try:
+        print_status("Checking for updates...", "info")
+        r = requests.get(api_url, timeout=10)
+        r.raise_for_status()
+        releases = r.json()
+        if args.unreleased:
+            print_status("Searching for unreleased (pre-release/beta/dev) versions...", "info")
+            # Najdi první pre-release nebo draft
+            release = next((rel for rel in releases if rel.get("prerelease") or rel.get("draft")), None)
+            if not release:
+                print_status("No unreleased (pre-release/beta/dev) version found.", "warning")
+                return
+            print_status(f"Found unreleased version: {release['tag_name']}", "info")
+        else:
+            # Najdi první stable release
+            release = next((rel for rel in releases if not rel.get("prerelease") and not rel.get("draft")), None)
+            if not release:
+                print_status("No stable release found.", "error")
+                return
+            print_status(f"Found latest stable version: {release['tag_name']}", "info")
+
+        asset = next((a for a in release["assets"] if a["name"] == "better-pkg"), None)
+        if not asset:
+            print_status("Cannot find the better-pkg binary in the release assets.", "error")
+            return
+        download_url = asset["browser_download_url"]
+
+        # Záloha stávajícího souboru
+        backup_path = __file__ + ".bak"
+        shutil.copy2(__file__, backup_path)
+        print_status(f"Backup of current version created: {backup_path}", "success")
+
+        # Stažení nové verze
+        print_status(f"Downloading better-pkg version {release['tag_name']}...", "info")
+        resp = requests.get(download_url, timeout=20)
+        resp.raise_for_status()
+        with open(__file__, "wb") as f:
+            f.write(resp.content)
+        print_status(f"Update to version {release['tag_name']} completed successfully!", "success")
+        print(f"{colors.BCyan}Please restart better-pkg to use the new version.{colors.NC}")
+    except Exception as e:
+        print_status(f"Update failed: {e}", "error")
+        print(f"{colors.BYellow}If something went wrong, you can restore the backup from: {__file__}.bak{colors.NC}")
 
 def version(args):
     colors = Colors()
-    print(f"{colors.BCyan}📦 better-pkg version 1.2-Beta was made by Vlastimil Dědek <dedek.vlastimil2@proton.me>{colors.NC}")
+    print(f"{colors.BCyan}📦 better-pkg version 1.2 was made by Vlastimil Dědek <dedek.vlastimil2@proton.me>{colors.NC}")
 
 def main():
     # Normalizujeme argumenty před parsováním
@@ -4353,7 +4379,9 @@ def main():
         "package": handle_package,
         "discover": handle_discover,
         "check": handle_check,
+        "add-repo": handle_add_repo,
         "version": version,
+        "self-update": self_update,
     }
 
     load_plugins(command_handlers, HOOKS, SETUP_FUNCTIONS, PACKAGE_GROUPS_EXTENSIONS, CUSTOM_JSON_HANDLERS)
