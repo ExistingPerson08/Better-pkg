@@ -161,6 +161,7 @@ def setup_argparse():
     install_parser.add_argument('-g', '--fetch', action='store_true', help='Fetch package from official source.')
     install_parser.add_argument('-c', '--plugin', action='store_true', help='Install better-pkg plugin.')
     install_parser.add_argument('-s', '--sclassic', action='store_true', help='Use snap --classic.')
+    install_parser.add_argument('-b', '--file', action='store_true', help='Install package from file.')
     install_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
     install_parser.add_argument('package', nargs='+', help='Package(s) to install')
 
@@ -3021,8 +3022,35 @@ def install(args):
             else:
                 print(f"{colors.BRed}Snap is not installed on this system.{colors.NC}")
         return
-
     
+    # Instalace ze souboru
+    if args.file:
+        for package in expanded_packages:
+            if not os.path.isfile(package):
+                print(f"{colors.BRed}File not found: {package}{colors.NC}")
+                continue
+            if package.endswith(".deb") and shutil.which("apt"):
+                print(f"{colors.BCyan}Installing DEB package with apt/dpkg: {package}{colors.NC}")
+                subprocess.run(["sudo", "dpkg", "-i", package])
+                subprocess.run(["sudo", "apt", "-f", "install", "-y"])
+            elif package.endswith(".rpm") and (shutil.which("dnf") or shutil.which("zypper") or shutil.which("rpm")):
+                print(f"{colors.BCyan}Installing RPM package: {package}{colors.NC}")
+                if shutil.which("dnf"):
+                    subprocess.run(["sudo", "dnf", "install", "-y", package])
+                elif shutil.which("zypper"):
+                    subprocess.run(["sudo", "zypper", "install", "-y", package])
+                else:
+                    subprocess.run(["sudo", "rpm", "-i", package])
+            elif (
+                (package.endswith(".pkg.tar.zst") or package.endswith(".pkg.tar.xz") or package.endswith(".pkg.tar.gz"))
+                and shutil.which("pacman")
+            ):
+                print(f"{colors.BCyan}Installing Pacman package: {package}{colors.NC}")
+                subprocess.run(["sudo", "pacman", "-U", "--noconfirm", package])
+            else:
+                print(f"{colors.BRed}Unknown or unsupported package file type for this system: {package}{colors.NC}")
+        return
+
     if args.plugin:
         import urllib.request
 
