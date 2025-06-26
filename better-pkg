@@ -203,6 +203,7 @@ def setup_argparse():
 
     # History command
     history_parser = subparsers.add_parser('history', help='Show history of actions')
+    history_parser.add_argument('-c', '--clear', action='store_true', help='Clear history')
 
     # Repair command
     repair_parser = subparsers.add_parser('repair', help='Try to repair broken packages')
@@ -925,6 +926,7 @@ def handle_update(args):
                 pm = "pacman"
             elif shutil.which("bootc"):
                 cmd = f"sudo bootc update{' -y' if args.y else ''}"
+                pm = "rpm-ostree"
             elif shutil.which("rpm-ostree"):
                 cmd = f"sudo rpm-ostree update{' -y' if args.y else ''}"
                 pm = "rpm-ostree"
@@ -1035,6 +1037,7 @@ def handle_upgrade(args):
                 pm = "pacman"
             elif shutil.which("bootc"):
                 cmd = f"sudo bootc update{' -y' if args.y else ''}"
+                pm = "rpm-ostree"
             elif shutil.which("rpm-ostree"):
                 cmd = f"sudo rpm-ostree update{' -y' if args.y else ''}"
                 pm = "rpm-ostree"
@@ -3733,6 +3736,15 @@ def handle_history(args):
     colors = Colors()
     if not os.path.exists(HISTORY_PATH):
         print_status("No history found.", "warning")
+        return
+    
+    if args.clear:
+        # Vymazání historie
+        try:
+            os.remove(HISTORY_PATH)
+            print_status("History cleared successfully.", "success")
+        except Exception as e:
+            print_status(f"Failed to clear history: {e}", "error")
         return
 
     # Načti historii
