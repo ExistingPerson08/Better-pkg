@@ -203,6 +203,7 @@ def setup_argparse():
 
     # History command
     history_parser = subparsers.add_parser('history', help='Show history of actions')
+    history_parser.add_argument('-u', '--user', action='store_true', help='Show only user actions (install, remove)')
     history_parser.add_argument('-c', '--clear', action='store_true', help='Clear history')
 
     # Repair command
@@ -3784,6 +3785,8 @@ def handle_history(args):
         print(f"\n{colors.BWhite}History of {manager.capitalize()}{colors.NC}")
         print(f"{colors.BPurple}{'─' * 28}{colors.NC}\n")
         for entry in actions:
+            if args.user and entry.get("action") not in ("install", "remove"):
+                continue
             action = entry.get("action", "").lower()
             color = action_colors.get(action, colors.BWhite)
             print(f"  {color}{action.capitalize():8}{colors.NC} {colors.BWhite}{entry['package']}{colors.NC} {colors.BYellow}{entry['datetime']}{colors.NC}")
