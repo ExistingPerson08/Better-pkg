@@ -118,6 +118,7 @@ def convert_shortcut(args_list):
         '-Je': 'setup-export',
         '-Jr': 'setup-remove',
         '-X': 'check',
+        '-O': 'history',
         '-V': 'version'
     }
 
@@ -204,6 +205,7 @@ def setup_argparse():
     # History command
     history_parser = subparsers.add_parser('history', help='Show history of actions')
     history_parser.add_argument('-u', '--user', action='store_true', help='Show only user actions (install, remove)')
+    history_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
     history_parser.add_argument('-c', '--clear', action='store_true', help='Clear history')
 
     # Repair command
@@ -3781,6 +3783,16 @@ def handle_history(args):
     }
 
     total = 0
+    if args.json:
+        json_entries = []
+        for manager, actions in grouped.items():
+            for entry in actions:
+                if args.user and entry.get("action") not in ("install", "remove"):
+                    continue
+                json_entries.append(entry)
+        print(json.dumps({"total": len(json_entries), "history": json_entries}, indent=2, ensure_ascii=False))
+        return
+
     for manager, actions in grouped.items():
         print(f"\n{colors.BWhite}History of {manager.capitalize()}{colors.NC}")
         print(f"{colors.BPurple}{'─' * 28}{colors.NC}\n")
