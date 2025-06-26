@@ -9,6 +9,7 @@ import shutil
 import signal
 import json
 import requests
+import datetime
 import importlib.util
 
 from time import sleep
@@ -117,6 +118,7 @@ def convert_shortcut(args_list):
         '-Je': 'setup-export',
         '-Jr': 'setup-remove',
         '-X': 'check',
+        '-O': 'history',
         '-V': 'version'
     }
 
@@ -163,6 +165,7 @@ def setup_argparse():
     install_parser.add_argument('-s', '--sclassic', action='store_true', help='Use snap --classic.')
     install_parser.add_argument('-b', '--file', action='store_true', help='Install package from file.')
     install_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
+    install_parser.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'yay', 'paru', 'flatpak', 'snap', 'brew', 'pacstall', 'zypper', 'betterpkg'], help='Force install from specific package manager')
     install_parser.add_argument('package', nargs='+', help='Package(s) to install')
 
     # Remove command
@@ -172,6 +175,7 @@ def setup_argparse():
     remove_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
     remove_parser.add_argument('-c', '--plugin', action='store_true', help='Remove better-pkg plugin.')
     remove_parser.add_argument('-p', '--purge', action='store_true', help='Delete package with data.')
+    remove_parser.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'yay', 'paru', 'flatpak', 'snap', 'brew', 'pacstall', 'zypper', 'betterpkg'], help='Force remove from specific package manager')
     remove_parser.add_argument('package', nargs='+', help='Package(s) to remove')
 
     # Search command
@@ -197,6 +201,12 @@ def setup_argparse():
     # Cleanup command
     cleanup_parser = subparsers.add_parser('cleanup', help='Remove unused packages')
     cleanup_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+
+    # History command
+    history_parser = subparsers.add_parser('history', help='Show history of actions')
+    history_parser.add_argument('-u', '--user', action='store_true', help='Show only user actions (install, remove)')
+    history_parser.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    history_parser.add_argument('-c', '--clear', action='store_true', help='Clear history')
 
     # Repair command
     repair_parser = subparsers.add_parser('repair', help='Try to repair broken packages')
@@ -581,6 +591,7 @@ CONFIG_DEFAULT = {
     "aliases": {
         "@a-my-fav": ["firefox", "ghostty", "nautilus"]
     },
+    "history": "true",
     "pre_update_commands": [],
     "post_update_commands": [],
     "pre_upgrade_commands": [],
@@ -611,6 +622,7 @@ def save_config(config):
         print(f"Chyba při ukládání konfigurace: {e}")
 
 config = load_config()
+history = config["history"]
 PRE_UPDATE_COMMANDS = config["pre_update_commands"]
 POST_UPDATE_COMMANDS = config["post_update_commands"]
 PRE_UPGRADE_COMMANDS = config["pre_upgrade_commands"]
@@ -628,6 +640,23 @@ def resolve_aliases(packages):
         else:
             resolved.add(pkg)
     return list(resolved)
+
+# Načtení historie
+
+HISTORY_PATH = os.path.expanduser("~/.local/share/better-tools/history.jsonl")
+
+def log_history(action, package, manager):
+    """Zapíše akci do historie."""
+    if history == "true":
+        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+        entry = {
+            "action": action,  # "install" nebo "remove"
+            "package": package,
+            "manager": manager,
+            "datetime": datetime.datetime.now().isoformat()
+        }
+        with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 # další definice
 
@@ -725,11 +754,12 @@ def install_package(pkgs, repo):
         return_code = process.poll()
 
         if return_code == 0:
-            print()  # Nový řádek po progress baru
+            print() 
             print_status("Installation completed successfully", "success")
             print(f"\n{colors.BWhite}Successfully installed packages:{colors.NC}")
             for pkg in pkgs:
                 print(f"{colors.BGreen}  • {pkg}{colors.NC}")
+                log_history("install", pkg, repo)
         else:
             print_status("Installation failed", "error")
             print(f"\n{colors.BWhite}Failed to install packages:{colors.NC}")
@@ -844,6 +874,7 @@ def remove_package(pkgs, repo):
             print(f"\n{colors.BWhite}Successfully removed packages:{colors.NC}")
             for pkg in pkgs:
                 print(f"{colors.BGreen}  • {pkg}{colors.NC}")
+                log_history("remove", pkg, repo)
         else:
             print_status("Remove failed", "error")
             print(f"\n{colors.BWhite}Failed to remove packages:{colors.NC}")
@@ -892,23 +923,32 @@ def handle_update(args):
             if shutil.which("nala"):
                 cmd = "sudo nala upgrade --full --no-autoremove -o Acquire::AllowReleaseInfoChange=true"
                 cmd += " -y" if args.y else ""
+                pm = "apt"
             elif shutil.which("garuda-update"):
                 cmd = f"sudo garuda-update{' --noconfirm' if args.y else ''}"
+                pm = "pacman"
             elif shutil.which("bootc"):
                 cmd = f"sudo bootc update{' -y' if args.y else ''}"
+                pm = "rpm-ostree"
             elif shutil.which("rpm-ostree"):
                 cmd = f"sudo rpm-ostree update{' -y' if args.y else ''}"
+                pm = "rpm-ostree"
             elif shutil.which("dnf"):
                 cmd = f"sudo dnf update{' -y' if args.y else ''}"
+                pm = "dnf"
             elif shutil.which("pacman"):
                 cmd = "sudo pacman -Syu --noconfirm"
+                pm = "pacman"
             elif shutil.which("zypper"):
                 cmd = f"sudo zypper update{' -y' if args.y else ''}"
+                pm = "zypper"
             else:
                 cmd = f"sudo apt update --allow-releaseinfo-change && sudo apt upgrade{' -y' if args.y else ''}"
+                pm = "apt"
 
             process = subprocess.run(cmd, shell=True, check=True)
             print_status("System update completed successfully", "success")
+            log_history("update", "all", pm)
             return True
         except subprocess.CalledProcessError:
             print_status("Error during system update", "error")
@@ -930,6 +970,7 @@ def handle_update(args):
                 try:
                     subprocess.run(cmd, shell=True, check=True)
                     print_status(f"{pm} update completed successfully", "success")
+                    log_history("update", "all", pm)
                 except subprocess.CalledProcessError:
                     print_status(f"Error updating {pm} packages", "error")
 
@@ -993,21 +1034,29 @@ def handle_upgrade(args):
         try:
             if shutil.which("pacman"):
                 cmd = "sudo pacman -Syyu --noconfirm"
+                pm = "pacman"
             elif shutil.which("garuda-update") and not args.use_native:
                 cmd = f"sudo garuda-update{' --noconfirm' if args.y else ''}{' --skip-mirrorlist' if args.skip_mirrors else ''}"
+                pm = "pacman"
             elif shutil.which("bootc"):
                 cmd = f"sudo bootc update{' -y' if args.y else ''}"
+                pm = "rpm-ostree"
             elif shutil.which("rpm-ostree"):
                 cmd = f"sudo rpm-ostree update{' -y' if args.y else ''}"
+                pm = "rpm-ostree"
             elif shutil.which("dnf"):
                 cmd = f"sudo dnf upgrade --refresh{' -y' if args.y else ''}"
+                pm = "dnf"
             elif shutil.which("zypper"):
                 cmd = f"sudo zypper update{' -y' if args.y else ''}"
+                pm = "zypper"
             else:
-                cmd = f"sudo apt dist-upgrade{' -y' if args.y else ''}"
+                cmd = f"sudo apt upgrade{' -y' if args.y else ''}"
+                pm = "apt"
 
             subprocess.run(cmd, shell=True, check=True)
             print_status("System upgrade completed successfully", "success")
+            log_history("upgrade", "all", pm)
             return True
         except subprocess.CalledProcessError:
             print_status("Error during system upgrade", "error")
@@ -1059,6 +1108,7 @@ def handle_upgrade(args):
                 try:
                     subprocess.run(cmd, shell=True, check=True)
                     print_status(f"{pm} upgrade completed successfully", "success")
+                    log_history("upgrade", "all", pm)
                     print("")
                 except subprocess.CalledProcessError:
                     print_status(f"Error upgrading {pm}", "error")
@@ -1133,18 +1183,24 @@ def handle_cleanup(args):
         print_status("Cleaning up system packages...")
         if shutil.which("nala"):
             cmd = f"sudo nala autoremove{' -y' if args.y else ''}"
+            pm = "apt"
         elif shutil.which("dnf"):
             cmd = f"sudo dnf autoremove{' -y' if args.y else ''}"
+            pm = "dnf"
         elif shutil.which("pacman"):
             cmd = "sudo pacman -Rns $(pacman -Qtdq) --noconfirm"
+            pm = "pacman"
         elif shutil.which("zypper"):
             cmd = f"sudo zypper autoremove{' -y' if args.y else ''}"
+            pm = "zypper"
         else:
             cmd = f"sudo apt autoremove{' -y' if args.y else ''}"
+            pm = "apt"
 
         try:
             subprocess.run(cmd, shell=True, check=True)
             print_status("System cleanup completed successfully", "success")
+            log_history("cleanup", "all", pm)
         except subprocess.CalledProcessError:
             print_status("Error during system cleanup", "error")
 
@@ -1155,6 +1211,7 @@ def handle_cleanup(args):
             try:
                 subprocess.run(cmd, shell=True, check=True)
                 print_status("Flatpak cleanup completed successfully", "success")
+                log_history("cleanup", "all", "flatpak")
             except subprocess.CalledProcessError:
                 print_status("Error during Flatpak cleanup", "error")
 
@@ -1164,6 +1221,7 @@ def handle_cleanup(args):
             try:
                 subprocess.run(cmd, shell=True, check=True)
                 print_status("Snap cleanup completed successfully", "success")
+                log_history("cleanup", "all", "snap")
             except subprocess.CalledProcessError:
                 print_status("Error during Snap cleanup", "error")
 
@@ -1191,18 +1249,24 @@ def handle_repair(args):
         print_status("Repairing system packages...")
         if shutil.which("nala"):
             cmd = f"sudo nala install --fix-broken && sudo nala autoremove{' -y' if args.y else ''}"
+            pm = "apt"
         elif shutil.which("dnf"):
             cmd = f"sudo dnf distro-sync && sudo dnf autoremove{' -y' if args.y else ''}"
+            pm = "dnf"
         elif shutil.which("pacman"):
             cmd = "sudo pacman -Syy && sudo pacman -Rns $(pacman -Qtdq) --noconfirm"
+            pm = "pacman"
         elif shutil.which("zypper"):
             cmd = f"sudo zypper verify{' -y' if args.y else ''}"
+            pm = "zypper"
         else:
             cmd = f"sudo apt install --fix-broken && sudo apt autoremove{' -y' if args.y else ''}"
+            pm = "apt"
 
         try:
             subprocess.run(cmd, shell=True, check=True)
             print_status("System repair completed successfully", "success")
+            log_history("repair", "all", pm)
         except subprocess.CalledProcessError:
             print_status("Error during system repair", "error")
 
@@ -1213,6 +1277,7 @@ def handle_repair(args):
             try:
                 subprocess.run(cmd, shell=True, check=True)
                 print_status("Flatpak repair completed successfully", "success")
+                log_history("repair", "all", "flatpak")
             except subprocess.CalledProcessError:
                 print_status("Error during Flatpak repair", "error")
 
@@ -3030,6 +3095,62 @@ def install(args):
                 print(f"{colors.BRed}Snap is not installed on this system.{colors.NC}")
         return
     
+    # Instalace z daného package manageru
+    if getattr(args, "manager", None):
+        repo = args.manager
+        pkgs = args.package
+        print_status(f"Installing {', '.join(pkgs)} from {repo}", "info")
+
+        if repo == "apt":
+            pkgs = ["steam-installer" if pkg == "steam" else pkg for pkg in pkgs]
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo nala install {pkg_str}" if shutil.which("nala") else f"sudo apt install {pkg_str}"
+        elif repo == "dnf":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo dnf install {pkg_str}"
+        elif repo == "pacman":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo pacman -S {pkg_str}"
+        elif repo == "zypper":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo zypper install {pkg_str}"
+        elif repo == "yay":
+            pkg_str = " ".join(pkgs)
+            cmd = f"yay -S {pkg_str}"
+        elif repo == "paru":
+            pkg_str = " ".join(pkgs)
+            cmd = f"paru -S {pkg_str}"
+        elif repo == "flatpak":
+            pkg_str = " ".join(pkgs)
+            cmd = f"flatpak install flathub {pkg_str}"
+        elif repo == "snap":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo snap install {pkg_str}"
+        elif repo == "brew":
+            pkg_str = " ".join(pkgs)
+            cmd = f"brew install {pkg_str}"
+        elif repo == "pacstall":
+            pkg_str = " ".join(pkgs)
+            cmd = f"pacstall -I {pkg_str}"
+        elif repo == "betterpkg":
+            argsi = argparse.Namespace()
+            argsi.package = pkgs
+            argsi.fetch = True
+            argsi.y = False
+            install(argsi)
+            return
+        else:
+            print_status(f"Unsupported package manager: {repo}", "error")
+            return
+
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print_status("Installation completed successfully", "success")
+            log_history("install", pkgs, repo)
+        except subprocess.CalledProcessError:
+            print_status("Installation failed", "error")
+        return
+    
     # Instalace ze souboru
     if args.file:
         for package in expanded_packages:
@@ -3318,6 +3439,64 @@ def remove(args):
             print(f"{colors.BYellow}Plugin '{plugin_name}' does not exist in {plugins_dir}.{colors.NC}")
         return
     
+    # Odinstalace z daného package manageru
+    if getattr(args, "manager", None):
+        repo = args.manager
+        pkgs = args.package
+        print_status(f"Removing {', '.join(pkgs)} from {repo}", "info")
+
+        if repo == "apt":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo nala remove {pkg_str}" if shutil.which("nala") else f"sudo apt remove {pkg_str}"
+        elif repo == "dnf":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo dnf remove {pkg_str}"
+        elif repo == "pacman":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo pacman -R {pkg_str}"
+        elif repo == "zypper":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo zypper remove {pkg_str}"
+        elif repo == "yay":
+            pkg_str = " ".join(pkgs)
+            cmd = f"yay -R {pkg_str}"
+        elif repo == "paru":
+            pkg_str = " ".join(pkgs)
+            cmd = f"paru -R {pkg_str}"
+        elif repo == "flatpak":
+            pkg_str = " ".join(pkgs)
+            cmd = f"flatpak remove {pkg_str}"
+        elif repo == "snap":
+            pkg_str = " ".join(pkgs)
+            cmd = f"sudo snap remove {pkg_str}"
+        elif repo == "brew":
+            pkg_str = " ".join(pkgs)
+            cmd = f"brew uninstall {pkg_str}"
+        elif repo == "pacstall":
+            pkg_str = " ".join(pkgs)
+            cmd = f"pacstall -R {pkg_str}"
+        elif repo == "betterpkg":
+            pkg_str = " ".join(pkgs)
+            if shutil.which("apt"):
+                cmd = f"sudo nala remove {pkg_str}" if shutil.which("nala") else f"sudo apt remove {pkg_str}"
+            elif shutil.which("dnf"):
+                cmd = f"sudo dnf remove {pkg_str}"
+            elif shutil.which("zypper"):
+                cmd = f"sudo zypper remove {pkg_str}"
+            else:
+                print_status(f"Unsupported package manager for betterpkg: {repo}", "error")
+                return
+        else:
+            print_status(f"Unsupported package manager: {repo}", "error")
+            return
+
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print_status("Removal completed successfully", "success")
+        except subprocess.CalledProcessError:
+            print_status("Removal failed", "error")
+        return
+    
     # Rozšíří aliasy na reálné balíčky
     expanded_packages = resolve_aliases(args.package)
 
@@ -3378,6 +3557,7 @@ def remove(args):
         print(f"{colors.BCyan}{repo}:{colors.NC}")
         for pkg in pkgs:
             print(f"{colors.BPurple}  • {pkg}{colors.NC}")
+            log_history("remove", pkg, repo)
 
     confirm = input(f"\n{colors.BYellow}Are you sure you want to remove these packages? (y/N) {colors.NC}").lower()
     if not confirm.startswith('y'):
@@ -3551,6 +3731,81 @@ def handle_package(args):
                 continue
 
     print(f"{colors.BRed}❌ Package {package} could not be processed. It may not be installed or supported.{colors.NC}")
+
+def handle_history(args):
+    """
+    Zobrazení historie akcí
+    """
+    colors = Colors()
+    if not os.path.exists(HISTORY_PATH):
+        print_status("No history found.", "warning")
+        return
+    
+    if args.clear:
+        # Vymazání historie
+        try:
+            os.remove(HISTORY_PATH)
+            print_status("History cleared successfully.", "success")
+        except Exception as e:
+            print_status(f"Failed to clear history: {e}", "error")
+        return
+
+    # Načti historii
+    entries = []
+    with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                entries.append(entry)
+            except Exception:
+                continue
+
+    if not entries:
+        print_status("No history entries found.", "warning")
+        return
+
+    # Skupiny podle správce balíčků
+    grouped = {}
+    for entry in entries:
+        manager = entry.get("manager", "unknown")
+        if manager not in grouped:
+            grouped[manager] = []
+        grouped[manager].append(entry)
+
+    # Barvy pro akce
+    action_colors = {
+        "install": colors.BGreen,
+        "remove": colors.BRed,
+        "update": colors.BCyan,
+        "upgrade": colors.BPurple,
+        "cleanup": colors.BYellow,
+        "repair": colors.BRed,
+    }
+
+    total = 0
+    if args.json:
+        json_entries = []
+        for manager, actions in grouped.items():
+            for entry in actions:
+                if args.user and entry.get("action") not in ("install", "remove"):
+                    continue
+                json_entries.append(entry)
+        print(json.dumps({"total": len(json_entries), "history": json_entries}, indent=2, ensure_ascii=False))
+        return
+
+    for manager, actions in grouped.items():
+        print(f"\n{colors.BWhite}History of {manager.capitalize()}{colors.NC}")
+        print(f"{colors.BPurple}{'─' * 28}{colors.NC}\n")
+        for entry in actions:
+            if args.user and entry.get("action") not in ("install", "remove"):
+                continue
+            action = entry.get("action", "").lower()
+            color = action_colors.get(action, colors.BWhite)
+            print(f"  {color}{action.capitalize():8}{colors.NC} {colors.BWhite}{entry['package']}{colors.NC} {colors.BYellow}{entry['datetime']}{colors.NC}")
+            total += 1
+        print()
+    print(f"{colors.BWhite}Total actions: {total}{colors.NC}")
+
 
 def handle_add_repo(args):
     """
@@ -4377,6 +4632,7 @@ def main():
         "setup-remove": setup_remove,
         "setup-export": setup_export,
         "package": handle_package,
+        "history": handle_history,
         "discover": handle_discover,
         "check": handle_check,
         "add-repo": handle_add_repo,
