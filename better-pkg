@@ -1839,6 +1839,69 @@ def handle_setup(args):
 
             return "unknown"
 
+        # Detekce rpm-ostree/bootc
+        is_immutable = shutil.which("rpm-ostree") or shutil.which("bootc")
+
+        # Flatpak aplikace pro doporučenou instalaci
+        if detect_desktop() == "gnome":
+            flatpak_apps = [
+                "org.libreoffice.LibreOffice",
+                "org.gnome.Lollypop",
+                "org.gnome.World.PikaBackup",
+                "org.gnome.dconf.Editor",
+                "org.gnome.Extensions",
+                "org.gnome.Tweaks",
+                "org.videolan.VLC",
+                "org.flameshot.Flameshot",
+                "io.github.flattool.Warehouse",
+                "com.github.tchx84.Flatseal"
+            ]
+        elif detect_desktop() == "kde":
+            flatpak_apps = [
+                "org.kde.elisa",
+                "org.libreoffice.LibreOffice",
+                "org.kde.konsole",
+                "org.kde.kcalc",
+                "org.kde.kate",
+                "org.kde.okular",
+                "org.videolan.VLC",
+                "org.flameshot.Flameshot",
+                "io.github.flattool.Warehouse",
+                "com.github.tchx84.Flatseal"
+            ]
+        else:
+            flatpak_apps = [
+                "org.libreoffice.LibreOffice",
+                "org.videolan.VLC",
+                "org.flameshot.Flameshot",
+                "io.github.flattool.Warehouse",
+                "com.github.tchx84.Flatseal"
+            ]
+
+        # Balíčky pro rpm-ostree (ovladače a kodeky)
+        rpm_ostree_packages = [
+            "mesa-va-drivers",
+            "mesa-vdpau-drivers",
+            "mesa-vulkan-drivers",
+            "intel-media-driver",
+            "libva-intel-driver",
+            "libva-utils",
+            "xorg-x11-drv-nvidia",
+            "akmod-nvidia",
+            "xorg-x11-drv-amdgpu",
+            "xorg-x11-drv-intel",
+            "ffmpeg",
+            "gstreamer1-plugins-base",
+            "gstreamer1-plugins-good",
+            "gstreamer1-plugins-bad-free",
+            "gstreamer1-plugins-bad-freeworld",
+            "gstreamer1-plugins-ugly",
+            "gstreamer1-libav",
+            "lame",
+            "x264",
+            "x265"
+        ]
+
         packages = {
             "libreoffice": ["apt", "dnf", "pacman", "yay"],
             "gnome-software": ["apt", "dnf", "pacman", "yay"],
@@ -1899,7 +1962,16 @@ def handle_setup(args):
             }
         }
 
-        if shutil.which("dnf"):
+        codecs = {
+            "ffmpeg": ["apt", "dnf", "pacman", "yay"],
+            "gstreamer": ["apt", "dnf", "pacman", "yay"],
+            "gstreamer-plugins-good": ["apt", "dnf"],
+            "gstreamer-plugins-bad": ["apt", "dnf"],
+            "gstreamer-plugins-ugly": ["apt", "dnf"],
+            "gstreamer-libav": ["apt", "dnf"],
+        }
+
+        if shutil.which("dnf") and not shutil.which("rpm-ostree"):
             fedora_version = get_fedora_version()
             if not fedora_version:
                 print("Error while detecting version of Fedora, please, set up rpmfusion by yourself.")
@@ -1914,93 +1986,114 @@ def handle_setup(args):
                 run_command("sudo dnf config-manager setopt fedora-cisco-openh264.enabled=1")
                 run_command("sudo dnf config-manager --enable fedora-cisco-openh264")
 
-        install_packages(packages)
-
-        if shutil.which("pacman"):
-            install_packages(arch_packages)
-
-        desktop = detect_desktop()
-        if desktop in desktop_packages:
-            print(f"Installing packages for {desktop} desktop environment...")
-            for pkg in desktop_packages[desktop]:
-                install_package(pkg, "pacman" if shutil.which("pacman") else "apt" if shutil.which("apt") else "dnf")
-
-        if shutil.which("flatpak"):
+        # Pokud je rpm-ostree nebo bootc, instaluj většinu aplikací jako flatpak a kodeky/ovladače přes rpm-ostree
+        if is_immutable:
+            print_status("It looks like you are using immutable distro. Installing most apps as Flatpak.", "info")
+            # Přidej Flathub pokud není
+            if shutil.which("flatpak"):
                 run_command("flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo")
                 print("Flathub was added.")
+                # Doporučené Flatpak aplikace
+                for app in flatpak_apps:
+                    install_package(app, "flatpak")
+                # Doporučené utility pro Flatpak
+                install_package("io.github.flattool.Warehouse", "flatpak")
+                install_package("com.github.tchx84.Flatseal", "flatpak")
+            else:
+                print("Flatpak is not installed, skipping Flatpak apps.")
+
+            # Kodeky a ovladače přes rpm-ostree
+            print("")
+            print_status("Installing codecs and drivers is recommended only on Fedora Silverblue (or spins). If you are using UBlue system or other immutable distro, skip installing codecs and drivers!", "warning")
+            codecs = input("Do you want to install recommended codecs and drivers via rpm-ostree? (Y/N): ").strip().lower()
+            if codecs == "y":
+                for pkg in rpm_ostree_packages:
+                    subprocess.run(["sudo", "rpm-ostree", "install", pkg], check=True)
+
         else:
-            print("Something went wrong, Flatpak is not installed so I cannot add Flathub.")
+            # Standardní instalace přes package managery
+            install_packages(packages)
 
-        if shutil.which("flatpak"):
-            install_package("org.gnome.World.PikaBackup", "flatpak")
-            install_package("com.github.tchx84.Flatseal", "flatpak")
-            if os.path.exists("/usr/bin/gnome-shell"):
-                install_package("com.mattjakeman.ExtensionManager", "flatpak")
+            if shutil.which("pacman"):
+                install_packages(arch_packages)
 
-        # Detekce a instalace ovladačů
-        try:
-            gpu_info = subprocess.check_output(['lspci'], text=True).lower()
+            desktop = detect_desktop()
+            if desktop in desktop_packages:
+                print(f"Installing packages for {desktop} desktop environment...")
+                for pkg in desktop_packages[desktop]:
+                    install_package(pkg, "pacman" if shutil.which("pacman") else "apt" if shutil.which("apt") else "dnf")
 
-            # Zjištění package manageru
-            pm = None
-            if shutil.which('apt'): pm = 'apt'
-            elif shutil.which('dnf'): pm = 'dnf'
-            elif shutil.which('pacman'): pm = 'pacman'
+            if shutil.which("flatpak"):
+                run_command("flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo")
+                print("Flathub was added.")
+                # Doporučené Flatpak utility
+                install_package("io.github.flattool.Warehouse", "flatpak")
+                install_package("com.github.tchx84.Flatseal", "flatpak")
+                install_package("org.gnome.World.PikaBackup", "flatpak")
+                install_package("com.github.tchx84.Flatseal", "flatpak")
+                if os.path.exists("/usr/bin/gnome-shell"):
+                    install_package("com.mattjakeman.ExtensionManager", "flatpak")
+            else:
+                print("Flatpak is not installed, skipping.")
 
-            if pm:
-                # Handle multiple GPUs
-                if 'nvidia' in gpu_info:
-                    print("\nDetected NVIDIA GPU. Installing NVIDIA drivers...")
-                    for pkg in gpu_drivers[pm]['nvidia']:
-                        install_package(pkg, pm)
+            print("")
+            user_input = input("Do you want to install additional codecs and drivers? (Y/N): ").strip().lower()
 
-                if any(x in gpu_info for x in ['amd', 'ati']):
-                    print("\nDetected AMD GPU. Installing AMD drivers...")
-                    for pkg in gpu_drivers[pm]['amd']:
-                        install_package(pkg, pm)
+            if user_input == "y":
+                print("Installing additional codecs and drivers...")
+                install_packages(codecs)
+            else:
+                print("No additional codecs and drivers will be installed.")                
 
-                if 'intel' in gpu_info:
-                    print("\nDetected Intel GPU. Installing Intel drivers...")
-                    for pkg in gpu_drivers[pm]['intel']:
-                        install_package(pkg, pm)
-                    print("\nInstalling NVIDIA drivers...")
-                    for pkg in gpu_drivers[pm]['nvidia']:
-                        install_package(pkg, pm)
-
-                if any(x in gpu_info for x in ['amd', 'ati']):
-                    print("\nInstalling AMD drivers...")
-                    for pkg in gpu_drivers[pm]['amd']:
-                        install_package(pkg, pm)
-
-                if 'intel' in gpu_info:
-                    print("\nInstalling Intel drivers...")
-                    for pkg in gpu_drivers[pm]['intel']:
-                        install_package(pkg, pm)
-
-                # Instalace obecných grafických balíčků
-                print("\nInstalling general graphics packages...")
-                install_package('mesa-utils', pm)
-                install_package('vulkan-tools', pm)
-
-        except Exception as e:
-            print(f"\nError during driver detection/installation: {e}")
-
-        print("")
-        user_input = input("Do you want to install additional codecs and drivers? (Y/N): ").strip().lower()
-
-        if user_input == "y":
-            print("Installing additional codecs and drivers...")
-
-            # Run the setup commands for printers, samba, and codecs
+            # Detekce a instalace ovladačů
             try:
-                subprocess.run(["better-pkg", "setup", "printers", "-y"], check=True)
-                subprocess.run(["better-pkg", "setup", "samba", "-y"], check=True)
-                subprocess.run(["better-pkg", "setup", "codecs", "-y"], check=True)
-                print("Additional codecs and drivers have been installed successfully.")
-            except subprocess.CalledProcessError as e:
-                print(f"Error occurred: {e}")
-        else:
-            print("No additional codecs and drivers will be installed.")
+                gpu_info = subprocess.check_output(['lspci'], text=True).lower()
+
+                # Zjištění package manageru
+                pm = None
+                if shutil.which('apt'): pm = 'apt'
+                elif shutil.which('dnf'): pm = 'dnf'
+                elif shutil.which('pacman'): pm = 'pacman'
+
+                if pm:
+                    # Handle multiple GPUs
+                    if 'nvidia' in gpu_info:
+                        print("\nDetected NVIDIA GPU. Installing NVIDIA drivers...")
+                        for pkg in gpu_drivers[pm]['nvidia']:
+                            install_package(pkg, pm)
+
+                    if any(x in gpu_info for x in ['amd', 'ati']):
+                        print("\nDetected AMD GPU. Installing AMD drivers...")
+                        for pkg in gpu_drivers[pm]['amd']:
+                            install_package(pkg, pm)
+
+                    if 'intel' in gpu_info:
+                        print("\nDetected Intel GPU. Installing Intel drivers...")
+                        for pkg in gpu_drivers[pm]['intel']:
+                            install_package(pkg, pm)
+                        print("\nInstalling NVIDIA drivers...")
+                        for pkg in gpu_drivers[pm]['nvidia']:
+                            install_package(pkg, pm)
+
+                    if any(x in gpu_info for x in ['amd', 'ati']):
+                        print("\nInstalling AMD drivers...")
+                        for pkg in gpu_drivers[pm]['amd']:
+                            install_package(pkg, pm)
+
+                    if 'intel' in gpu_info:
+                        print("\nInstalling Intel drivers...")
+                        for pkg in gpu_drivers[pm]['intel']:
+                            install_package(pkg, pm)
+
+                    # Instalace obecných grafických balíčků
+                    if user_input == "y":
+                        print("\nInstalling general graphics packages...")
+                        install_package('mesa-utils', pm)
+                        install_package('vulkan-tools', pm)
+                        print("\nCodecs and drivers were installed.")
+
+            except Exception as e:
+                print(f"\nError during driver detection/installation: {e}")
 
         print("\nRecommended packages and drivers installation completed!")
         print("Note: A system restart may be required for the drivers to take effect.")
