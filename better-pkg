@@ -1979,7 +1979,7 @@ def handle_setup(args):
 
         # Pokud je rpm-ostree nebo bootc, instaluj většinu aplikací jako flatpak a kodeky/ovladače přes rpm-ostree
         if is_immutable:
-            print("It looks like you are using immutable distro. Installing most apps as Flatpak and codecs/drivers via rpm-ostree.")
+            print_status("It looks like you are using immutable distro. Installing most apps as Flatpak.", "info")
             # Přidej Flathub pokud není
             if shutil.which("flatpak"):
                 run_command("flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo")
@@ -1994,8 +1994,12 @@ def handle_setup(args):
                 print("Flatpak is not installed, skipping Flatpak apps.")
 
             # Kodeky a ovladače přes rpm-ostree
-            for pkg in rpm_ostree_packages:
-                install_package(pkg, "rpm-ostree")
+            print("")
+            print_status("Installing codecs and drivers is recommended only on Fedora Silverblue (or spins). If you are using UBlue system or other immutable distro, skip installing codecs and drivers!", "warning")
+            codecs = input("Do you want to install recommended codecs and drivers via rpm-ostree? (Y/N): ").strip().lower()
+            if codecs == "y":
+                for pkg in rpm_ostree_packages:
+                    subprocess.run(["sudo", "rpm-ostree", "install", pkg], check=True)
 
         else:
             # Standardní instalace přes package managery
@@ -2021,7 +2025,24 @@ def handle_setup(args):
                 if os.path.exists("/usr/bin/gnome-shell"):
                     install_package("com.mattjakeman.ExtensionManager", "flatpak")
             else:
-                print("Flatpak is not installed, skipping.")                
+                print("Flatpak is not installed, skipping.")
+
+            print("")
+            user_input = input("Do you want to install additional codecs and drivers? (Y/N): ").strip().lower()
+
+            if user_input == "y":
+                print("Installing additional codecs and drivers...")
+
+                # Run the setup commands for printers, samba, and codecs
+                try:
+                    subprocess.run(["better-pkg", "setup", "printers", "-y"], check=True)
+                    subprocess.run(["better-pkg", "setup", "samba", "-y"], check=True)
+                    subprocess.run(["better-pkg", "setup", "codecs", "-y"], check=True)
+                    print("Additional codecs and drivers have been installed successfully.")
+                except subprocess.CalledProcessError as e:
+                    print(f"Error occurred: {e}")
+            else:
+                print("No additional codecs and drivers will be installed.")                
 
             # Detekce a instalace ovladačů
             try:
@@ -2070,23 +2091,6 @@ def handle_setup(args):
 
             except Exception as e:
                 print(f"\nError during driver detection/installation: {e}")
-
-        print("")
-        user_input = input("Do you want to install additional codecs and drivers? (Y/N): ").strip().lower()
-
-        if user_input == "y":
-            print("Installing additional codecs and drivers...")
-
-            # Run the setup commands for printers, samba, and codecs
-            try:
-                subprocess.run(["better-pkg", "setup", "printers", "-y"], check=True)
-                subprocess.run(["better-pkg", "setup", "samba", "-y"], check=True)
-                subprocess.run(["better-pkg", "setup", "codecs", "-y"], check=True)
-                print("Additional codecs and drivers have been installed successfully.")
-            except subprocess.CalledProcessError as e:
-                print(f"Error occurred: {e}")
-        else:
-            print("No additional codecs and drivers will be installed.")
 
         print("\nRecommended packages and drivers installation completed!")
         print("Note: A system restart may be required for the drivers to take effect.")
