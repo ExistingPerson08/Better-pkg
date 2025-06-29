@@ -1962,6 +1962,15 @@ def handle_setup(args):
             }
         }
 
+        codecs = {
+            "ffmpeg": ["apt", "dnf", "pacman", "yay"],
+            "gstreamer": ["apt", "dnf", "pacman", "yay"],
+            "gstreamer-plugins-good": ["apt", "dnf"],
+            "gstreamer-plugins-bad": ["apt", "dnf"],
+            "gstreamer-plugins-ugly": ["apt", "dnf"],
+            "gstreamer-libav": ["apt", "dnf"],
+        }
+
         if shutil.which("dnf") and not shutil.which("rpm-ostree"):
             fedora_version = get_fedora_version()
             if not fedora_version:
@@ -2032,15 +2041,7 @@ def handle_setup(args):
 
             if user_input == "y":
                 print("Installing additional codecs and drivers...")
-
-                # Run the setup commands for printers, samba, and codecs
-                try:
-                    subprocess.run(["better-pkg", "setup", "printers", "-y"], check=True)
-                    subprocess.run(["better-pkg", "setup", "samba", "-y"], check=True)
-                    subprocess.run(["better-pkg", "setup", "codecs", "-y"], check=True)
-                    print("Additional codecs and drivers have been installed successfully.")
-                except subprocess.CalledProcessError as e:
-                    print(f"Error occurred: {e}")
+                install_packages(codecs)
             else:
                 print("No additional codecs and drivers will be installed.")                
 
@@ -2085,9 +2086,11 @@ def handle_setup(args):
                             install_package(pkg, pm)
 
                     # Instalace obecných grafických balíčků
-                    print("\nInstalling general graphics packages...")
-                    install_package('mesa-utils', pm)
-                    install_package('vulkan-tools', pm)
+                    if user_input == "y":
+                        print("\nInstalling general graphics packages...")
+                        install_package('mesa-utils', pm)
+                        install_package('vulkan-tools', pm)
+                        print("\nCodecs and drivers were installed.")
 
             except Exception as e:
                 print(f"\nError during driver detection/installation: {e}")
