@@ -1,6 +1,6 @@
 # better-pkg
 
-**better-pkg** is a universal CLI package managers wrapper for various Linux distributions and package managers. It allows you to install, remove, search, export, and manage packages and plugins and more from a single tool, whether you use APT, DNF, Pacman, Zypper, Flatpak, Snap, Homebrew, and more.
+**better-pkg** is a universal CLI package managers wrapper for various Linux distributions and package managers. It allows you to install, remove, search, export, and manage packages and plugins and more from just one script, whether you use APT, DNF, Pacman, Zypper, Flatpak, Snap, Homebrew, and more.
 
 ## Features
 
@@ -32,4 +32,4 @@
 ## Contributing
 
 - Pull requests and ideas are welcome!
-- For most new features, use the plugin system.
+- For most new features create plugins.
