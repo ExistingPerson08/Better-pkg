@@ -4654,8 +4654,7 @@ def handle_check(args):
 
 def self_update(args):
     """
-    Aktualizuje better-pkg na poslední verzi z GitHub Releases.
-    Přidána možnost aktualizace na nevydané (pre-release, beta, dev) verze pomocí --unreleased.
+    Aktualizuje better-pkg na podle aktuální verze na GitHubu.
     """
     colors = Colors()
     api_url = "https://api.github.com/repos/ExistingPerson08/better-pkg/releases"
@@ -4679,6 +4678,21 @@ def self_update(args):
                 print_status("No stable release found.", "error")
                 return
             print_status(f"Found latest stable version: {release['tag_name']}", "info")
+
+        # Zobraz changelog (body)
+        changelog = release.get("body", "")
+        if changelog:
+            print(f"\n{colors.BWhite}Changelog for {release['tag_name']}:{colors.NC}\n")
+            print(changelog)
+            print("")
+        else:
+            print(f"{colors.BYellow}No changelog available for this release.{colors.NC}")
+
+        # Potvrzení od uživatele
+        confirm = input(f"{colors.BYellow}Do you want to upgrade to version {release['tag_name']}? (y/N) {colors.NC}").strip().lower()
+        if not confirm.startswith('y'):
+            print_status("Update cancelled by user.", "warning")
+            return
 
         asset = next((a for a in release["assets"] if a["name"] == "better-pkg"), None)
         if not asset:
@@ -4705,7 +4719,7 @@ def self_update(args):
 
 def version(args):
     colors = Colors()
-    print(f"{colors.BCyan}📦 better-pkg version 1.2 was made by Vlastimil Dědek <dedek.vlastimil2@proton.me>{colors.NC}")
+    print(f"{colors.BCyan}📦 better-pkg version 1.1 was made by Vlastimil Dědek <dedek.vlastimil2@proton.me>{colors.NC}")
 
 def main():
     # Normalizujeme argumenty před parsováním
