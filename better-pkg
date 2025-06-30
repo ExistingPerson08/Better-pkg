@@ -1186,7 +1186,7 @@ def handle_cleanup(args):
         if shutil.which("nala"):
             cmd = f"sudo nala autoremove{' -y' if args.y else ''}"
             pm = "apt"
-        elif shutil.which("dnf"):
+        elif shutil.which("dnf") and not shutil.which("rpm-ostree"):
             cmd = f"sudo dnf autoremove{' -y' if args.y else ''}"
             pm = "dnf"
         elif shutil.which("pacman"):
