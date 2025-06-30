@@ -177,6 +177,7 @@ def setup_argparse():
     remove_parser.add_argument('-p', '--purge', action='store_true', help='Delete package with data.')
     remove_parser.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'yay', 'paru', 'flatpak', 'snap', 'brew', 'pacstall', 'zypper', 'betterpkg'], help='Force remove from specific package manager')
     remove_parser.add_argument('package', nargs='+', help='Package(s) to remove')
+    remove_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
 
     # Search command
     search_parser = subparsers.add_parser('search', help='Search for package(s)')
@@ -1185,7 +1186,7 @@ def handle_cleanup(args):
         if shutil.which("nala"):
             cmd = f"sudo nala autoremove{' -y' if args.y else ''}"
             pm = "apt"
-        elif shutil.which("dnf"):
+        elif shutil.which("dnf") and not shutil.which("rpm-ostree"):
             cmd = f"sudo dnf autoremove{' -y' if args.y else ''}"
             pm = "dnf"
         elif shutil.which("pacman"):
@@ -3198,34 +3199,34 @@ def install(args):
         if repo == "apt":
             pkgs = ["steam-installer" if pkg == "steam" else pkg for pkg in pkgs]
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo nala install {pkg_str}" if shutil.which("nala") else f"sudo apt install {pkg_str}"
+            cmd = f"sudo nala install {pkg_str} {'-y' if args.y else ''}" if shutil.which("nala") else f"sudo apt install {pkg_str} {'-y' if args.y else ''}"
         elif repo == "dnf":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo dnf install {pkg_str}"
+            cmd = f"sudo dnf install {pkg_str} {'-y' if args.y else ''}"
         elif repo == "pacman":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo pacman -S {pkg_str}"
+            cmd = f"sudo pacman -S {pkg_str} {'--noconfirm' if args.y else ''}"
         elif repo == "zypper":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo zypper install {pkg_str}"
+            cmd = f"sudo zypper install {pkg_str} {'-y' if args.y else ''}"
         elif repo == "yay":
             pkg_str = " ".join(pkgs)
-            cmd = f"yay -S {pkg_str}"
+            cmd = f"yay -S {pkg_str} {'--noconfirm' if args.y else ''}"
         elif repo == "paru":
             pkg_str = " ".join(pkgs)
-            cmd = f"paru -S {pkg_str}"
+            cmd = f"paru -S {pkg_str} {'--noconfirm' if args.y else ''}"
         elif repo == "flatpak":
             pkg_str = " ".join(pkgs)
-            cmd = f"flatpak install flathub {pkg_str}"
+            cmd = f"flatpak install flathub {pkg_str} {'-y' if args.y else ''}"
         elif repo == "snap":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo snap install {pkg_str}"
+            cmd = f"sudo snap install {pkg_str} {'-y' if args.y else ''}"
         elif repo == "brew":
             pkg_str = " ".join(pkgs)
-            cmd = f"brew install {pkg_str}"
+            cmd = f"brew install {pkg_str} {'-y' if args.y else ''}"
         elif repo == "pacstall":
             pkg_str = " ".join(pkgs)
-            cmd = f"pacstall -I {pkg_str}"
+            cmd = f"pacstall -I {pkg_str} {'-y' if args.y else ''}"
         elif repo == "betterpkg":
             argsi = argparse.Namespace()
             argsi.package = pkgs
@@ -3541,42 +3542,42 @@ def remove(args):
 
         if repo == "apt":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo nala remove {pkg_str}" if shutil.which("nala") else f"sudo apt remove {pkg_str}"
+            cmd = f"sudo nala {'purge' if args.purge else 'remove'} {pkg_str} {'-y' if args.y else ''}" if shutil.which("nala") else f"sudo apt {'purge' if args.purge else 'remove'} {pkg_str} {'-y' if args.y else ''}"
         elif repo == "dnf":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo dnf remove {pkg_str}"
+            cmd = f"sudo dnf {'remove --allowerasing' if args.purge else 'remove'} {pkg_str} {'-y' if args.y else ''}"
         elif repo == "pacman":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo pacman -R {pkg_str}"
+            cmd = f"sudo pacman -{'Rns' if args.purge else 'R'} --noconfirm {pkg_str}" if args.y else f"sudo pacman -{'Rns' if args.purge else 'R'} {pkg_str}"
         elif repo == "zypper":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo zypper remove {pkg_str}"
+            cmd = f"sudo zypper remove {'--delete-orphans' if args.purge else ''} {pkg_str} {'-y' if args.y else ''}"
         elif repo == "yay":
             pkg_str = " ".join(pkgs)
-            cmd = f"yay -R {pkg_str}"
+            cmd = f"yay -{'Rns' if args.purge else 'R'} --noconfirm {pkg_str}" if args.y else f"yay -{'Rns' if args.purge else 'R'} {pkg_str}"
         elif repo == "paru":
             pkg_str = " ".join(pkgs)
-            cmd = f"paru -R {pkg_str}"
+            cmd = f"paru -{'Rns' if args.purge else 'R'} --noconfirm {pkg_str}" if args.y else f"paru -{'Rns' if args.purge else 'R'} {pkg_str}"
         elif repo == "flatpak":
             pkg_str = " ".join(pkgs)
-            cmd = f"flatpak remove {pkg_str}"
+            cmd = f"flatpak remove {'--delete-data' if args.purge else ''} {pkg_str} {'-y' if args.y else ''}"
         elif repo == "snap":
             pkg_str = " ".join(pkgs)
-            cmd = f"sudo snap remove {pkg_str}"
+            cmd = f"sudo snap remove {'--purge' if args.purge else ''} {pkg_str}"
         elif repo == "brew":
             pkg_str = " ".join(pkgs)
             cmd = f"brew uninstall {pkg_str}"
         elif repo == "pacstall":
             pkg_str = " ".join(pkgs)
-            cmd = f"pacstall -R {pkg_str}"
+            cmd = f"pacstall -R {pkg_str} {'-y' if args.y else ''}"
         elif repo == "betterpkg":
             pkg_str = " ".join(pkgs)
             if shutil.which("apt"):
-                cmd = f"sudo nala remove {pkg_str}" if shutil.which("nala") else f"sudo apt remove {pkg_str}"
+                cmd = f"sudo nala {'purge' if args.purge else 'remove'} {pkg_str} {'-y' if args.y else ''}" if shutil.which("nala") else f"sudo apt {'purge' if args.purge else 'remove'} {pkg_str} {'-y' if args.y else ''}"
             elif shutil.which("dnf"):
-                cmd = f"sudo dnf remove {pkg_str}"
+                cmd = f"sudo dnf {'remove --allowerasing' if args.purge else 'remove'} {pkg_str} {'-y' if args.y else ''}"
             elif shutil.which("zypper"):
-                cmd = f"sudo zypper remove {pkg_str}"
+                cmd = f"sudo zypper remove {pkg_str} {'-y' if args.y else ''}"
             else:
                 print_status(f"Unsupported package manager for betterpkg: {repo}", "error")
                 return
@@ -3653,10 +3654,11 @@ def remove(args):
             print(f"{colors.BPurple}  • {pkg}{colors.NC}")
             log_history("remove", pkg, repo)
 
-    confirm = input(f"\n{colors.BYellow}Are you sure you want to remove these packages? (y/N) {colors.NC}").lower()
-    if not confirm.startswith('y'):
-        print_status("Operation cancelled", "warning")
-        return
+    if not args.y:
+        confirm = input(f"\n{colors.BYellow}Are you sure you want to remove these packages? (y/N) {colors.NC}").lower()
+        if not confirm.startswith('y'):
+            print_status("Operation cancelled", "warning")
+            return
 
     # Odstranění balíčků
     failed_removals = []
@@ -4719,7 +4721,7 @@ def self_update(args):
 
 def version(args):
     colors = Colors()
-    print(f"{colors.BCyan}📦 better-pkg version 1.1-Beta was made by ExistingPerson08{colors.NC}")
+    print(f"{colors.BCyan}📦 better-pkg version 1.1-Beta was made by ExistingPerson08>{colors.NC}")
 
 def main():
     # Normalizujeme argumenty před parsováním
