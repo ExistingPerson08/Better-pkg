@@ -2302,6 +2302,22 @@ def setup_custom(args):
     brew_packages = config.get("brew", {})  # Přidáno pro Homebrew
 
     installed_packages = []
+    print("")
+
+    # --- Spuštění příkazů ze sekce "commands" ---
+    commands = config.get("commands", [])
+    if commands:
+        if not isinstance(commands, list):
+            print_status("Commands section must be a list of strings.", "error")
+        else:
+            for cmd in commands:
+                print_status(f"Running: {cmd}", "info")
+                print("")
+                try:
+                    subprocess.run(cmd, shell=True, check=True)
+                except Exception as e:
+                    print_status(f"Error running '{cmd}': {e}", "error")
+                print("")
 
     # Seskupení balíčků podle package manageru
     package_groups = {}
