@@ -245,12 +245,29 @@ def setup_argparse():
     #Discover commands
     discover_parser = subparsers.add_parser('discover', help='Discover new packages')
 
-    #Add repositories command
-    add_repo_parser = subparsers.add_parser('add-repo', help='Add repository')
-    add_repo_parser.add_argument('-c', '--choose', action='store_true', help='Choose repository from list')
-    add_repo_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
-    add_repo_parser.add_argument('repo', help='Repository to add')
+    # Repo command group
+    repo_parser = subparsers.add_parser('repo', help='Manage repositories')
+    repo_subparsers = repo_parser.add_subparsers(dest='repo_command', help='Repository actions')
 
+    # repo add
+    repo_add = repo_subparsers.add_parser('add', help='Add a repository')
+    repo_add.add_argument('repo', nargs='?', help='Repository to add')
+    repo_add.add_argument('-c', '--choose', action='store_true', help='Choose repository from recommended list')
+    repo_add.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'zypper', 'flatpak', 'brew'], help='Force add to specific package manager')
+
+    # repo remove
+    repo_remove = repo_subparsers.add_parser('remove', help='Remove a repository')
+    repo_remove.add_argument('repo', nargs='?', help='Repository to remove')
+    repo_remove.add_argument('-c', '--choose', action='store_true', help='Choose repository from installed list')
+    repo_remove.add_argument('-u', '--user', action='store_true', help='Only enabled user repositories')
+    repo_remove.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    repo_remove.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'zypper', 'flatpak', 'brew'], help='Force remove from specific package manager')
+
+    # repo list
+    repo_list = repo_subparsers.add_parser('list', help='List configured repositories')
+    repo_list.add_argument('-u', '--user', action='store_true', help='Only enabled user repositories')
+    repo_list.add_argument('-j', '--json', action='store_true', help='Output as JSON')
+    repo_list.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'zypper', 'flatpak', 'brew'], help='List repos for specific package manager')
 
     #Check commands
     check_parser = subparsers.add_parser('check', help='Check (and refresh) packages, services and repositories')
@@ -3918,106 +3935,403 @@ def handle_history(args):
         print()
     print(f"{colors.BWhite}Total actions: {total}{colors.NC}")
 
-
-def handle_add_repo(args):
-    """
-    Přidá repozitář podle správce balíčků a typu repozitáře.
-    Pokud je args.choose, umožní vybrat doporučené repozitáře.
-    """
+def handle_repo(args):
+    import re
     colors = Colors()
+    pm = getattr(args, "manager", None)
 
-    # Doporučené repozitáře podle distribuce
-    recommended_repos = []
-    if shutil.which("pacman"):
-        recommended_repos = [
-            ("Chaotic-AUR", "https://aur.chaotic.cx/", "Huge prebuilt AUR repo"),
-            ("BlackArch", "https://blackarch.org/", "Penetration testing repo"),
-        ]
-    elif shutil.which("dnf"):
-        recommended_repos = [
-        ]
-    elif shutil.which("apt"):
-        recommended_repos = [
-            ("Debian Backports", "http://deb.debian.org/debian/ bullseye-backports main", "Newer package versions"),
-            ("Debian Multimedia", "http://www.deb-multimedia.org bullseye main non-free", "Codecs, multimedia"),
-            ("Google Chrome repo", "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main", "Official Chrome"),
-        ]
-    elif shutil.which("zypper"):
-        recommended_repos = [
-            ("Packman", "http://packman.inode.at/suse/openSUSE_Tumbleweed/", "Codecs, multimedia, games"),
-            ("openSUSE Tumbleweed", "https://download.opensuse.org/tumbleweed/repo/oss/", "Rolling release repo"),
-        ]
-
-    if args.choose:
+    def detect_pm():
+        if pm:
+            return pm
+        if shutil.which("apt"):
+            return "apt"
         if shutil.which("dnf"):
-            print(f"{colors.BCyan}There are no recomended repos for Fedora yet.{colors.NC}")
-            return
-        
-        print(f"\n{colors.BWhite}Recommended repositories:{colors.NC}")
-        for idx, (name, url, desc) in enumerate(recommended_repos):
-            print(f"{colors.BCyan}[{idx}]{colors.NC} {name} - {desc} ({colors.BYellow}{url}{colors.NC})")
-        try:
-            selected = input(f"\n{colors.BYellow}Select a repository to add [0-{len(recommended_repos)-1}] (Enter to cancel): {colors.NC}").strip()
-            if not selected:
-                print_status("Operation cancelled.", "warning")
-                return
-            idx = int(selected)
-            repo_url = recommended_repos[idx][1]
-        except Exception:
-            print_status("Invalid selection.", "error")
-            return
-    else:
-        repo_url = args.repo
+            return "dnf"
+        if shutil.which("pacman"):
+            return "pacman"
+        if shutil.which("zypper"):
+            return "zypper"
+        if shutil.which("flatpak"):
+            return "flatpak"
+        if shutil.which("brew"):
+            return "brew"
+        return None
 
-    # Přidání repozitáře podle správce balíčků
-    if shutil.which("apt"):
-        if repo_url.startswith("ppa:"):
-            # PPA repozitář (Ubuntu)
-            cmd = f"sudo add-apt-repository -y {repo_url}"
-        elif repo_url.startswith("deb "):
-            # Debian-style repozitář
-            cmd = f'echo "{repo_url}" | sudo tee /etc/apt/sources.list.d/custom-repo.list'
-        else:
-            # URL repozitáře, pokus o přidání jako debian repo
-            cmd = f'echo "deb {repo_url}" | sudo tee /etc/apt/sources.list.d/custom-repo.list'
-        print_status(f"Adding repository: {repo_url}", "info")
-        subprocess.run(cmd, shell=True)
-        print_status("Updating package list...", "info")
-        subprocess.run("sudo apt update", shell=True)
-        print_status("Repository added successfully.", "success")
-    elif shutil.which("dnf"):
-        # DNF repo (Fedora)
-        if repo_url.endswith(".repo"):
-            cmd = f"sudo dnf config-manager addrepo --from-repofile={repo_url}"
-        else:
-            # Pokus o přidání repozitáře podle url
-            cmd = f"sudo dnf config-manager addrepo --from-repofile={repo_url}"
-        print_status(f"Adding repository: {repo_url}", "info")
-        subprocess.run(cmd, shell=True)
-        print_status("Repository added successfully.", "success")
-    elif shutil.which("zypper"):
-        # Zypper repo (openSUSE)
-        cmd = f"sudo zypper ar {repo_url} custom-repo"
-        print_status(f"Adding repository: {repo_url}", "info")
-        subprocess.run(cmd, shell=True)
-        print_status("Refreshing repositories...", "info")
-        subprocess.run("sudo zypper refresh", shell=True)
-        print_status("Repository added successfully.", "success")
-    elif shutil.which("pacman"):
-        # Pacman repo (Arch)
-        repo_name = "customrepo"
-        repo_entry = f"\n[{repo_name}]\nServer = {repo_url}\n"
-        conf_path = "/etc/pacman.conf"
-        print_status(f"Adding repository: {repo_url}", "info")
-        try:
-            subprocess.run(f"echo '{repo_entry}' | sudo tee -a {conf_path}", shell=True, check=True)
-            print_status("Repository added to pacman.conf.", "success")
+    def list_repos(pm):
+        repos = []
+        if pm == "apt":
+            try:
+                result = subprocess.run("grep ^deb /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null", shell=True, capture_output=True, text=True)
+                for idx, line in enumerate(result.stdout.splitlines()):
+                    parts = line.split()
+                    repo_url = parts[1] if len(parts) > 1 else ""
+                    repo_name = parts[-1] if len(parts) > 2 else ""
+                    repos.append((idx, repo_url, repo_name))
+            except Exception:
+                pass
+        elif pm == "dnf":
+            try:
+                result = subprocess.run("dnf repolist --all", shell=True, capture_output=True, text=True)
+                for idx, line in enumerate(result.stdout.splitlines()):
+                    if line and not line.startswith("repo id") and not line.startswith("Last metadata"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            repo_id = parts[0]
+                            repo_name = " ".join(parts[1:])
+                            repos.append((idx, repo_id, repo_name))
+            except Exception:
+                pass
+        elif pm == "pacman":
+            try:
+                result = subprocess.run("grep ^\\[ /etc/pacman.conf", shell=True, capture_output=True, text=True)
+                for idx, line in enumerate(result.stdout.splitlines()):
+                    repo_id = line.strip().strip("[]")
+                    repos.append((idx, repo_id, ""))
+            except Exception:
+                pass
+        elif pm == "zypper":
+            try:
+                result = subprocess.run("zypper repos", shell=True, capture_output=True, text=True)
+                for line in result.stdout.splitlines():
+                    if line.strip().startswith("#") or not line.strip():
+                        continue
+                    parts = line.split("|")
+                    if len(parts) >= 3 and parts[0].strip().isdigit():
+                        idx = int(parts[0].strip())
+                        repo_name = parts[1].strip()
+                        repo_url = parts[2].strip()
+                        repos.append((idx, repo_name, repo_url))
+            except Exception:
+                pass
+        elif pm == "flatpak":
+            try:
+                result = subprocess.run("flatpak remotes", shell=True, capture_output=True, text=True)
+                for idx, line in enumerate(result.stdout.splitlines()):
+                    if line.strip():
+                        parts = line.split()
+                        repo_name = parts[0]
+                        repo_url = parts[1] if len(parts) > 1 else ""
+                        repos.append((idx, repo_name, repo_url))
+            except Exception:
+                pass
+        elif pm == "brew":
+            try:
+                result = subprocess.run("brew tap", shell=True, capture_output=True, text=True)
+                taps = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+                repos = [(idx, tap, "tap") for idx, tap in enumerate(taps)]
+            except Exception:
+                pass
+
+        if args.user:
+            if pm == "apt":
+                repos = [r for r in repos if not r[1].startswith("#")]
+            elif pm == "dnf":
+                repos = [r for r in repos if "enabled" in r[2].lower() or "enabled" in r[1].lower()]
+            elif pm == "pacman":
+                repos = [r for r in repos if not r[1].startswith("#")]
+            elif pm == "zypper":
+                repos = []
+                try:
+                    result = subprocess.run("zypper repos --details", shell=True, capture_output=True, text=True)
+                    enabled_names = set()
+                    for line in result.stdout.splitlines():
+                        if "|" in line:
+                            parts = [p.strip() for p in line.split("|")]
+                            if len(parts) > 6 and parts[6].lower() == "yes":
+                                enabled_names.add(parts[1])
+                    repos = [r for r in repos if r[1] in enabled_names]
+                except Exception:
+                    pass
+            elif pm == "flatpak":
+                # Všechny Flatpak repozitáře jsou zaplé
+                pass
+            elif pm == "brew":
+                # Všechny Brew repozitáře jsou zaplé
+                pass
+
+        if args.json:
+            print(json.dumps([{"index": idx, "id": repo_id, "name": repo_name} for idx, repo_id, repo_name in repos], indent=2))
+ 
+        return repos if repos is not None else []
+
+    def add_repo(pm, repo_url):
+        print_status(f"Adding repository to {pm}...", "info")
+        success = False
+
+        def get_name(url):
+            #Předpřipravené názvy repozitářů
+            if 'flathub.org' in url:
+                return 'flathub'
+            if 'aur.chaotic.cx' in url:
+                return 'chaotic-aur'
+            if 'elementary.io' in url:
+                return 'AppCenter'
+            
+            url = re.sub(r'^https?://', '', url)
+            url = url.rstrip('/').replace('.git', '')
+            if url.endswith('.flatpakrepo'):
+                domain = url.split('/')[0]
+                if domain.startswith('flatpak.'):
+                    domain = domain[len('flatpak.'):]
+                if domain.startswith('repo.'):
+                    domain = domain[len('repo.'):]
+                return domain.lower()
+            
+            parts = re.split(r'[/:]', url)
+            parts = [p for p in parts if p and p not in ("repo", "repos", "repository", "flatpakrepo", "deb", "rpm")]
+            if parts:
+                # If last part looks like a file, use previous part
+                last = parts[-1].split('?')[0]
+                if '.' in last and not last.replace('.', '').isalnum():
+                    if len(parts) > 1:
+                        last = parts[-2]
+                name = re.sub(r'\.(list|repo)$', '', last)
+                name = re.sub(r'[^a-zA-Z0-9_\-\.]', '', name)
+                if name:
+                    return name.lower()
+            return "customrepo"
+
+        if pm == "apt":
+            if repo_url.startswith("ppa:"):
+                cmd = f"sudo add-apt-repository -y {repo_url}"
+            elif repo_url.startswith("deb "):
+                # Try to extract repo name from url part
+                url_part = repo_url.split()[1] if len(repo_url.split()) > 1 else repo_url
+                repo_name = get_name(url_part)
+                cmd = f'echo "{repo_url}" | sudo tee /etc/apt/sources.list.d/{repo_name}.list'
+            else:
+                repo_name = get_name(repo_url)
+                cmd = f'echo "deb {repo_url}" | sudo tee /etc/apt/sources.list.d/{repo_name}.list'
+            result = subprocess.run(cmd, shell=True)
+            subprocess.run("sudo apt update", shell=True)
+            success = result.returncode == 0
+        elif pm == "dnf":
+            repo_name = get_name(repo_url)
+            cmd = f"sudo dnf config-manager --add-repo {repo_url}"
+            result = subprocess.run(cmd, shell=True)
+            success = result.returncode == 0
+        elif pm == "pacman":
+            repo_name = get_name(repo_url)
+            repo_entry = f"\n[{repo_name}]\nServer = {repo_url}\n"
+            conf_path = "/etc/pacman.conf"
+            result = subprocess.run(f"echo '{repo_entry}' | sudo tee -a {conf_path}", shell=True)
             subprocess.run("sudo pacman -Sy", shell=True)
-        except Exception as e:
-            print_status(f"Failed to add repository: {e}", "error")
-    else:
-        print_status("No supported package manager found for adding repositories.", "error")
+            success = result.returncode == 0
+        elif pm == "zypper":
+            repo_name = get_name(repo_url)
+            cmd = f"sudo zypper ar {repo_url} {repo_name}"
+            result = subprocess.run(cmd, shell=True)
+            subprocess.run("sudo zypper refresh", shell=True)
+            success = result.returncode == 0
+        elif pm == "flatpak":
+            if " " in repo_url:
+                name, url = repo_url.split(" ", 1)
+            else:
+                url = repo_url
+                name = get_name(url)
+            cmd = f"flatpak remote-add --if-not-exists {name} {url}"
+            result = subprocess.run(cmd, shell=True)
+            success = result.returncode == 0
+        elif pm == "brew":
+            repo_name = get_name(repo_url)
+            cmd = f"brew tap {repo_url}"
+            result = subprocess.run(cmd, shell=True)
+            success = result.returncode == 0
+        else:
+            print_status("No supported package manager found.", "error")
+            return
 
+        if success:
+            print_status(f"Repository added successfully to {pm}.", "success")
+        else:
+            print_status(f"Failed to add repository to {pm}.", "error")
+
+    def remove_repo(pm, repo_url):
+        print_status(f"Removing repository from {pm}...", "info")
+        success = False
+        if pm == "apt":
+            result = subprocess.run(f"sudo rm -f /etc/apt/sources.list.d/*{repo_url}*", shell=True)
+            subprocess.run("sudo apt update", shell=True)
+            success = result.returncode == 0
+        elif pm == "dnf":
+            result = subprocess.run(f"sudo dnf config-manager --remove-repo {repo_url}", shell=True)
+            success = result.returncode == 0
+        elif pm == "pacman":
+            result = subprocess.run(f"sudo sed -i '/\\[{repo_url}\\]/,/^$/d' /etc/pacman.conf", shell=True)
+            subprocess.run("sudo pacman -Sy", shell=True)
+            success = result.returncode == 0
+        elif pm == "zypper":
+            result = subprocess.run(f"sudo zypper rr {repo_url}", shell=True)
+            success = result.returncode == 0
+        elif pm == "flatpak":
+            result = subprocess.run(f"flatpak remote-delete {repo_url}", shell=True)
+            success = result.returncode == 0
+        elif pm == "brew":
+            result = subprocess.run(f"brew untap {repo_url}", shell=True)
+            success = result.returncode == 0
+        else:
+            print_status("No supported package manager found.", "error")
+            return
+
+        if success:
+            print_status(f"Repository removed successfully from {pm}.", "success")
+        else:
+            print_status(f"Failed to remove repository from {pm}.", "error")
+
+    # --- Hlavní logika ---
+    pm = detect_pm()
+
+    if args.repo_command == "add":
+        if args.choose:
+            recommended_repos = []
+            if pm == "pacman":
+                recommended_repos = [
+                    ("Chaotic-AUR", "https://aur.chaotic.cx/", "Huge prebuilt AUR repo"),
+                    ("BlackArch", "https://blackarch.org/", "Penetration testing repo"),
+                ]
+            elif pm == "apt":
+                recommended_repos = [
+                    ("Debian Backports", "http://deb.debian.org/debian/ bullseye-backports main", "Newer package versions"),
+                    ("Debian Multimedia", "http://www.deb-multimedia.org bullseye main non-free", "Codecs, multimedia"),
+                    ("Google Chrome repo", "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main", "Official Chrome"),
+                ]
+            elif pm == "zypper":
+                recommended_repos = [
+                    ("Packman", "http://packman.inode.at/suse/openSUSE_Tumbleweed/", "Codecs, multimedia, games"),
+                    ("openSUSE Tumbleweed", "https://download.opensuse.org/tumbleweed/repo/oss/", "Rolling release repo"),
+                ]
+            elif pm == "dnf":
+                print(f"{colors.BCyan}There are no recommended repos for Fedora yet.{colors.NC}")
+                return
+            elif pm == "flatpak":
+                recommended_repos = [
+                    ("Flathub", "https://flathub.org/repo/flathub.flatpakrepo", "Main Flatpak repository"),
+                    ("AppCenter", "https://flatpak.elementary.io/repo.flatpakrepo", "Elementary OS appstore"),
+                ]
+
+            if not recommended_repos:
+                print_status("No recommended repositories for this package manager.", "warning")
+                return
+
+            print(f"\n{colors.BWhite}Recommended repositories for {pm}:{colors.NC}")
+            for idx, (name, url, desc) in enumerate(recommended_repos):
+                print(f"{colors.BCyan}[{idx}]{colors.NC} {name} - {desc} ({colors.BYellow}{url}{colors.NC})")
+            try:
+                selected = input(f"\n{colors.BYellow}Select a repository to add [0-{len(recommended_repos)-1}] (Enter to cancel): {colors.NC}").strip()
+                if not selected:
+                    print_status("Operation cancelled.", "warning")
+                    return
+                idx = int(selected)
+                repo_url = recommended_repos[idx][1]
+            except Exception:
+                print_status("Invalid selection.", "error")
+                return
+            add_repo(pm, repo_url)
+        else:
+            if args.repo:
+                add_repo(pm, args.repo)
+            else:
+                print_status("Specify repository URL or use --choose.", "error")
+    
+    elif args.repo_command == "remove":
+        if getattr(args, "manager", None):
+            if args.repo:
+                remove_repo(pm, args.repo)
+            elif args.choose:
+                repos = list_repos(pm)
+                if not repos:
+                    print_status("No repositories found.", "warning")
+                    return
+                print(f"\n{colors.BWhite}Repositories for {pm}:{colors.NC}")
+                print(f"{colors.BPurple}{'─' * (len('Repositories for ' + pm) + 1)}{colors.NC}\n")
+                for idx, repo_id, repo_name in repos:
+                    print(f"{colors.BGreen}[{idx}]{colors.NC} {repo_id} - {repo_name}")
+                print()
+                selected = input(f"{colors.BYellow}Select which repository to remove [0-{len(repos)-1}] (or type c to cancel): {colors.NC}").strip()
+                if selected.lower() == "c" or selected == "":
+                    print_status("Operation cancelled", "warning")
+                    return
+                try:
+                    idx = int(selected)
+                    if not 0 <= idx < len(repos):
+                        print_status("Invalid selection", "error")
+                        return
+                    repo_id = repos[idx][1]
+                    remove_repo(pm, repo_id)
+                except Exception:
+                    print_status("Invalid input", "error")
+                    return
+            else:
+                print_status("Specify repository name or use --choose.", "error")
+
+        elif args.choose:
+            managers = []
+            for cand_pm in ["apt", "dnf", "pacman", "zypper", "flatpak", "brew"]:
+                if shutil.which(cand_pm):
+                    managers.append(cand_pm)
+            if not managers:
+                print_status("No supported package manager found.", "error")
+                return
+            print(f"\n{colors.BWhite}Available package managers:{colors.NC}")
+            for i, m in enumerate(managers):
+                print(f"{colors.BGreen}[{i}]{colors.NC} {m}")
+            print()
+            selected_pm = input(f"{colors.BYellow}Select package manager [0-{len(managers)-1}] (or type c to cancel): {colors.NC}").strip()
+            if selected_pm.lower() == "c" or selected_pm == "":
+                print_status("Operation cancelled", "warning")
+                return
+            try:
+                idx_pm = int(selected_pm)
+                if not 0 <= idx_pm < len(managers):
+                    print_status("Invalid selection", "error")
+                    return
+                pm2 = managers[idx_pm]
+            except Exception:
+                print_status("Invalid input", "error")
+                return
+            repos = list_repos(pm2)
+            if not repos:
+                print_status("No repositories found.", "warning")
+                return
+            print(f"\n{colors.BWhite}Repositories for {pm2}:{colors.NC}")
+            print(f"{colors.BPurple}{'─' * (len('Repositories for ' + pm2) + 1)}{colors.NC}\n")
+            for idx, repo_id, repo_name in repos:
+                print(f"{colors.BGreen}[{idx}]{colors.NC} {repo_id} - {repo_name}")
+            print()
+            selected = input(f"{colors.BYellow}Select which repository to remove [0-{len(repos)-1}] (or type c to cancel): {colors.NC}").strip()
+            if selected.lower() == "c" or selected == "":
+                print_status("Operation cancelled", "warning")
+                return
+            try:
+                idx = int(selected)
+                if not 0 <= idx < len(repos):
+                    print_status("Invalid selection", "error")
+                    return
+                repo_id = repos[idx][1]
+                remove_repo(pm2, repo_id)
+            except Exception:
+                print_status("Invalid input", "error")
+                return
+        elif args.repo:
+            remove_repo(pm, args.repo)
+        else:
+            print_status("Specify repository name or use --choose.", "error")
+
+    elif args.repo_command == "list":
+        repos = list_repos(pm)
+        if args.json:
+            print(json.dumps([{"index": idx, "id": repo_id, "name": repo_name} for idx, repo_id, repo_name in repos], indent=2))
+            return
+        if repos:
+            print(f"\n{colors.BWhite}Repositories for {pm}:{colors.NC}")
+            print(f"{colors.BPurple}{'─' * (len('Repositories for ' + pm) + 1)}{colors.NC}\n")
+            for idx, repo_id, repo_name in repos:
+                print(f"{colors.BGreen}[{idx}]{colors.NC} {repo_id} - {repo_name}")
+            print(f"\n{colors.BWhite}Total repositories: {len(repos)}{colors.NC}")
+        else:
+            print_status("No repositories found.", "warning")
+    else:
+        print_status("Unknown repo command.", "error")
 
 def handle_discover(args):
     """
@@ -4761,7 +5075,7 @@ def main():
         "history": handle_history,
         "discover": handle_discover,
         "check": handle_check,
-        "add-repo": handle_add_repo,
+        "repo": handle_repo,
         "version": version,
         "self-update": self_update,
     }
