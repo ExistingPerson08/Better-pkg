@@ -175,7 +175,7 @@ def setup_argparse():
     remove_parser.add_argument('-d', '--description', action='store_true', help='Search in package descriptions')
     remove_parser.add_argument('-c', '--plugin', action='store_true', help='Remove better-pkg plugin.')
     remove_parser.add_argument('-p', '--purge', action='store_true', help='Delete package with data.')
-    remove_parser.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'yay', 'paru', 'flatpak', 'snap', 'brew', 'pacstall', 'zypper', 'betterpkg'], help='Force remove from specific package manager')
+    remove_parser.add_argument('-m', '--manager', choices=['apt', 'dnf', 'pacman', 'yay', 'paru', 'flatpak', 'snap', 'brew', 'pacstall', 'zypper', 'betterpkg', 'appimage'], help='Force remove from specific package manager')
     remove_parser.add_argument('package', nargs='+', help='Package(s) to remove')
     remove_parser.add_argument('-y', action='store_true', help='Automatic yas to prompts.')
 
@@ -3281,6 +3281,7 @@ def install(args):
     
     # Instalace ze souboru
     if args.file:
+        import tarfile
         for package in expanded_packages:
             if not os.path.isfile(package):
                 print(f"{colors.BRed}File not found: {package}{colors.NC}")
@@ -3303,6 +3304,43 @@ def install(args):
             ):
                 print(f"{colors.BCyan}Installing Pacman package: {package}{colors.NC}")
                 subprocess.run(["sudo", "pacman", "-U", "--noconfirm", package])
+            elif package.endswith(".AppImage") or package.endswith(".appimage"):
+                print(f"{colors.BCyan}Preparing AppImage: {package}{colors.NC}")
+                try:
+                    subprocess.run(["chmod", "+x", package], check=True)
+                    print(f"{colors.BGreen}AppImage is now executable. You can run it with: {package}{colors.NC}")
+                except Exception as e:
+                    print(f"{colors.BRed}Failed to make AppImage executable: {e}{colors.NC}")
+                
+                target_dir = os.path.expanduser("~/.local/share/appimages/")
+                os.makedirs(target_dir, exist_ok=True)
+                target_path = os.path.join(target_dir, os.path.basename(package))
+                shutil.copy2(package, target_path)
+                os.chmod(target_path, 0o755)
+                print_status(f"AppImage installed to {target_path}", "info")
+
+                desktop_dir = os.path.expanduser("~/.local/share/applications")
+                os.makedirs(desktop_dir, exist_ok=True)
+                desktop_file = os.path.join(desktop_dir, f"{os.path.splitext(os.path.basename(package))[0]}.desktop")
+                with open(desktop_file, "w") as f:
+                    f.write(f"""[Desktop Entry]
+Type=Application
+Name={os.path.splitext(os.path.basename(package))[0]}
+Exec={target_path}
+Icon=application-default-icon
+Terminal=false
+""")
+                print_status(f"Desktop entry created: {desktop_file}", "info")
+            elif package.endswith(".tar.gz"):
+                extract_dir = os.path.join("/tmp", os.path.basename(package).replace(".tar.gz", ""))
+                print(f"{colors.BCyan}Extracting .tar.gz archive to {extract_dir}{colors.NC}")
+                try:
+                    os.makedirs(extract_dir, exist_ok=True)
+                    with tarfile.open(package, "r:gz") as tar:
+                        tar.extractall(path=extract_dir)
+                    print(f"{colors.BGreen}Archive extracted. Please check {extract_dir} for install instructions or binaries.{colors.NC}")
+                except Exception as e:
+                    print(f"{colors.BRed}Failed to extract .tar.gz: {e}{colors.NC}")
             else:
                 print(f"{colors.BRed}Unknown or unsupported package file type for this system: {package}{colors.NC}")
         return
@@ -3603,6 +3641,35 @@ def remove(args):
         elif repo == "pacstall":
             pkg_str = " ".join(pkgs)
             cmd = f"pacstall -R {pkg_str} {'-y' if args.y else ''}"
+        elif repo == "appimage":
+            def remove_appimage(appimage_name):
+                appimage_dir = os.path.expanduser("~/.local/share/appimages/")
+                desktop_dir = os.path.expanduser("~/.local/share/applications/")
+                removed = False
+
+                # Odstranění AppImage souboru
+                for ext in ("", ".AppImage", ".appimage"):
+                    path = os.path.join(appimage_dir, appimage_name)
+                    if not path.lower().endswith(".appimage"):
+                        path += ext
+                    if os.path.exists(path):
+                        os.remove(path)
+                        print_status(f"Removed AppImage: {path}", "success")
+                        removed = True
+
+                # Odstranění .desktop souboru
+                desktop_file = os.path.join(desktop_dir, f"{os.path.splitext(appimage_name)[0]}.desktop")
+                if os.path.exists(desktop_file):
+                    os.remove(desktop_file)
+                    print_status(f"Removed desktop entry: {desktop_file}", "success")
+                    removed = True
+
+                if not removed:
+                    print_status(f"AppImage '{appimage_name}' not found.", "warning")
+
+            for appimage_name in pkgs:
+                remove_appimage(appimage_name)
+            return
         elif repo == "betterpkg":
             pkg_str = " ".join(pkgs)
             if shutil.which("apt"):
@@ -5051,7 +5118,7 @@ def self_update(args):
 
 def version(args):
     colors = Colors()
-    print(f"{colors.BCyan}📦 better-pkg version 1.1-Beta was made by ExistingPerson08>{colors.NC}")
+    print(f"{colors.BCyan}📦 better-pkg version 1.1-Beta 2 was made by ExistingPerson08{colors.NC}")
 
 def main():
     # Normalizujeme argumenty před parsováním
