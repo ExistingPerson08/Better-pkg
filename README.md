@@ -5,9 +5,10 @@
 ## Features
 
 - **Just one python script**
-- **Universal install/remove/search** for packages (apt, dnf, pacman, zypper, yay, paru, flatpak, snap, brew, pacstall, ...)
+- **Universal install/remove/search** for packages (apt, dnf, pacman, zypper, yay, paru, flatpak, snap, brew, pacstall, appimage)
+- **Universal update and cleanup** (apt, dnf, pacman, zypper, yay, paru, flatpak, snap, brew, pacstall, distrobox, firmwa
 - **Export/import package lists** (for migration or backup)
-- **Plugin support** – easily extend with new features
+- **[Plugin support](https://github.com/ExistingPerson08/Better-pkg-data/tree/main/plugins)** – easily extend with new features
 - **Automation of common tasks** (update, upgrade, cleanup, repair, cache)
 - **Security checks** (firewall, SELinux, auditd, fail2ban, sudoers, ...)
 - **Colorful, user-friendly output**
