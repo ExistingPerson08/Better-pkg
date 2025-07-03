@@ -3327,7 +3327,7 @@ def install(args):
 Type=Application
 Name={os.path.splitext(os.path.basename(package))[0]}
 Exec={target_path}
-Icon=application-default-icon
+Icon={os.path.splitext(os.path.basename(package))[0]}
 Terminal=false
 """)
                 print_status(f"Desktop entry created: {desktop_file}", "info")
