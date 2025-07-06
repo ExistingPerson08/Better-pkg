@@ -3676,12 +3676,11 @@ def remove(args):
                 icon_dir = os.path.expanduser("~/.local/share/icons/")
                 removed = False
 
-                # Normalize name (remove .appimage/.AppImage extension if present)
                 base_name = appimage_name
                 if base_name.lower().endswith(".appimage"):
                     base_name = os.path.splitext(base_name)[0]
 
-                # Remove AppImage file(s)
+                # Odstranění Appimage
                 for ext in ("", ".AppImage", ".appimage"):
                     path = os.path.join(appimage_dir, base_name + ext)
                     if os.path.exists(path):
@@ -3689,14 +3688,14 @@ def remove(args):
                         print_status(f"Removed AppImage: {path}", "success")
                         removed = True
 
-                # Remove .desktop file
+                # Odstranění .desktop souboru
                 desktop_file = os.path.join(desktop_dir, base_name + ".desktop")
                 if os.path.exists(desktop_file):
                     os.remove(desktop_file)
                     print_status(f"Removed desktop entry: {desktop_file}", "success")
                     removed = True
 
-                # Remove icon(s)
+                # Odstranění ikony
                 for ext in (".png", ".svg"):
                     icon_file = os.path.join(icon_dir, base_name + ext)
                     if os.path.exists(icon_file):
