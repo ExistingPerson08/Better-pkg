@@ -242,6 +242,10 @@ def setup_argparse():
     cache_parser = subparsers.add_parser('cache', help='Remove package cache')
     cache_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
 
+    #Run commands
+    run_parser = subparsers.add_parser('run', help='Run an application')
+    run_parser.add_argument('app', nargs='+', help='Application to run')
+
     #Discover commands
     discover_parser = subparsers.add_parser('discover', help='Discover new packages')
 
@@ -4333,6 +4337,55 @@ def handle_repo(args):
     else:
         print_status("Unknown repo command.", "error")
 
+def handle_run(args):
+    """
+    Spustí aplikaci
+    """
+    app_name = " ".join(args.app)
+    colors = Colors()
+
+    def try_run(cmd, desc):
+        try:
+            subprocess.run(cmd, shell=True, check=True)
+            print_status(f"Application launched using {desc}.", "success")
+            return True
+        except Exception:
+            return False
+
+    # 1. Spustit aplikaci přímo
+    if shutil.which(app_name.split()[0]):
+        if try_run(app_name, "system path"):
+            return
+        else:
+            return
+
+    # 2. Skusit přes flatpak (s předěláním názvu na ID)
+    if shutil.which("flatpak"):
+        if try_run(f"flatpak run {app_name}", "flatpak (direct)"):
+            return
+        try:
+            result = subprocess.run(
+                ["flatpak", "list", "--app", "--columns=application,name"],
+                capture_output=True, text=True
+            )
+            app_id = None
+            for line in result.stdout.splitlines():
+                cols = line.split("\t")
+                if len(cols) >= 2 and (app_name.lower() in cols[0].lower() or app_name.lower() in cols[1].lower()):
+                    app_id = cols[0]
+                    break
+            if app_id and try_run(f"flatpak run {app_id}", f"flatpak ({app_id})"):
+                return
+        except Exception:
+            pass
+        prefixes = ["org.gnome.", "org.kde.", "com.", "io.", "net."]
+        for prefix in prefixes:
+            app_id = prefix + app_name.capitalize()
+            if try_run(f"flatpak run {app_id}", f"flatpak ({app_id})"):
+                return
+
+    print_status(f"Could not launch '{app_name}'. Application not found.", "error")
+
 def handle_discover(args):
     """
     Něco jako obchod s aplikacemi, ale pro CLI.
@@ -5073,6 +5126,7 @@ def main():
         "setup-export": setup_export,
         "package": handle_package,
         "history": handle_history,
+        "run": handle_run,
         "discover": handle_discover,
         "check": handle_check,
         "repo": handle_repo,
