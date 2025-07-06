@@ -3305,6 +3305,30 @@ def install(args):
                 print(f"{colors.BCyan}Installing Pacman package: {package}{colors.NC}")
                 subprocess.run(["sudo", "pacman", "-U", "--noconfirm", package])
             elif package.endswith(".AppImage") or package.endswith(".appimage"):
+                def extract_appimage_icon(appimage_path, target_icon_dir):
+                    # Pokusí se extrahovat ikonu z AppImage
+                    import tempfile
+                    import glob
+                    import shutil
+                    import subprocess
+
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        try:
+                            subprocess.run([appimage_path, "--appimage-extract"], cwd=tmpdir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            # Najdi největší PNG/SVG v extrahovaném adresáři
+                            icon_candidates = glob.glob(os.path.join(tmpdir, "squashfs-root", "**", "*.png"), recursive=True)
+                            icon_candidates += glob.glob(os.path.join(tmpdir, "squashfs-root", "**", "*.svg"), recursive=True)
+                            if icon_candidates:
+                                # Vyber největší (nejvyšší rozlišení)
+                                icon_path = max(icon_candidates, key=lambda p: os.path.getsize(p))
+                                icon_name = os.path.splitext(os.path.basename(appimage_path))[0] + os.path.splitext(icon_path)[1]
+                                target_icon_path = os.path.join(target_icon_dir, icon_name)
+                                shutil.copy2(icon_path, target_icon_path)
+                                return target_icon_path
+                        except Exception:
+                            pass
+                    return None
+
                 print(f"{colors.BCyan}Preparing AppImage: {package}{colors.NC}")
                 try:
                     subprocess.run(["chmod", "+x", package], check=True)
@@ -3321,13 +3345,17 @@ def install(args):
 
                 desktop_dir = os.path.expanduser("~/.local/share/applications")
                 os.makedirs(desktop_dir, exist_ok=True)
+                icon_dir = os.path.expanduser("~/.local/share/icons")
+                os.makedirs(icon_dir, exist_ok=True)
+                icon_path = extract_appimage_icon(target_path, icon_dir)
+                icon_entry = f"Icon={icon_path}" if icon_path else "Icon=application-default-icon"
                 desktop_file = os.path.join(desktop_dir, f"{os.path.splitext(os.path.basename(package))[0]}.desktop")
                 with open(desktop_file, "w") as f:
                     f.write(f"""[Desktop Entry]
 Type=Application
 Name={os.path.splitext(os.path.basename(package))[0]}
 Exec={target_path}
-Icon={os.path.splitext(os.path.basename(package))[0]}
+{icon_entry}
 Terminal=false
 """)
                 print_status(f"Desktop entry created: {desktop_file}", "info")
@@ -3645,24 +3673,36 @@ def remove(args):
             def remove_appimage(appimage_name):
                 appimage_dir = os.path.expanduser("~/.local/share/appimages/")
                 desktop_dir = os.path.expanduser("~/.local/share/applications/")
+                icon_dir = os.path.expanduser("~/.local/share/icons/")
                 removed = False
 
-                # Odstranění AppImage souboru
+                # Normalize name (remove .appimage/.AppImage extension if present)
+                base_name = appimage_name
+                if base_name.lower().endswith(".appimage"):
+                    base_name = os.path.splitext(base_name)[0]
+
+                # Remove AppImage file(s)
                 for ext in ("", ".AppImage", ".appimage"):
-                    path = os.path.join(appimage_dir, appimage_name)
-                    if not path.lower().endswith(".appimage"):
-                        path += ext
+                    path = os.path.join(appimage_dir, base_name + ext)
                     if os.path.exists(path):
                         os.remove(path)
                         print_status(f"Removed AppImage: {path}", "success")
                         removed = True
 
-                # Odstranění .desktop souboru
-                desktop_file = os.path.join(desktop_dir, f"{os.path.splitext(appimage_name)[0]}.desktop")
+                # Remove .desktop file
+                desktop_file = os.path.join(desktop_dir, base_name + ".desktop")
                 if os.path.exists(desktop_file):
                     os.remove(desktop_file)
                     print_status(f"Removed desktop entry: {desktop_file}", "success")
                     removed = True
+
+                # Remove icon(s)
+                for ext in (".png", ".svg"):
+                    icon_file = os.path.join(icon_dir, base_name + ext)
+                    if os.path.exists(icon_file):
+                        os.remove(icon_file)
+                        print_status(f"Removed icon: {icon_file}", "success")
+                        removed = True
 
                 if not removed:
                     print_status(f"AppImage '{appimage_name}' not found.", "warning")
