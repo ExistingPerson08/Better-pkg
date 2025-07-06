@@ -2298,11 +2298,9 @@ def handle_setup(args):
 
 def setup_custom(args):
     """Setup custom packages from a configuration file."""
+    import distro as distro_mod
 
-    if not args.y:
-        confirm = input("This will install packages from the configuration file. Are you sure? (y/N) ").strip().lower()
-        if not confirm.startswith('y'):
-            return
+    colors = Colors()
 
     try:
         with open(args.config_file, 'r') as f:
@@ -2318,36 +2316,187 @@ def setup_custom(args):
         print("Error: Invalid configuration file format")
         return
 
-    packages = config.get("packages", {})
-    flatpak_packages = config.get("flatpak", {})
-    brew_packages = config.get("brew", {})  # Přidáno pro Homebrew
-
-    installed_packages = []
+    # --- Základní informace ---
+    info_keys = ["name", "description", "created", "author", "version"]
+    print(f"{colors.BWhite}Custom setup file info:{colors.NC}")
+    for key in info_keys:
+        if key in config:
+            print(f"{colors.BCyan}{key.capitalize()}: {colors.BGreen}{config[key]}{colors.NC}")
     print("")
 
-    # --- Spuštění příkazů ze sekce "commands" ---
+    # --- Poznámky ---
+    if "notes" in config:
+        print(f"{colors.BYellow}Notes:{colors.NC}")
+        notes = config["notes"]
+        if isinstance(notes, list):
+            for note in notes:
+                print(f"  - {note}")
+        else:
+            print(f"  {notes}")
+        print("")
+
+    if not args.y:
+        confirm = input("Do you want to run this setup? (y/N) ").strip().lower()
+        if not confirm.startswith('y'):
+            return
+
+    # --- Kontrola podmínek ---
+    def check_condition(cond):
+        # Jednoduché podmínky: distro, file exists, command exists, env var
+        if not isinstance(cond, dict):
+            return True
+        if "distro" in cond:
+            sys_id = ""
+            if shutil.which("apt"):
+                sys_id = "debian"
+            elif shutil.which("dnf"):
+                sys_id = "fedora"
+            elif shutil.which("pacman"):
+                sys_id = "arch"
+            elif shutil.which("zypper"):
+                sys_id = "opensuse"
+            else:
+                sys_id = distro_mod.id() if hasattr(distro_mod, "id") else platform.system().lower()
+            if sys_id not in cond["distro"]:
+                return False
+        if "file_exists" in cond:
+            if not os.path.exists(cond["file_exists"]):
+                return False
+        if "command_exists" in cond:
+            if not shutil.which(cond["command_exists"]):
+                return False
+        if "env" in cond:
+            var = cond["env"]
+            if isinstance(var, str):
+                if var not in os.environ:
+                    return False
+            elif isinstance(var, dict):
+                for k, v in var.items():
+                    if os.environ.get(k) != v:
+                        return False
+        return True
+
+    # --- Instalace better-pkg pluginů ---
+    plugins = config.get("plugins", [])
+    if plugins:
+        print_status("Installing better-pkg plugins...", "info")
+        for plugin in plugins:
+            try:
+                install(argparse.Namespace(package=[plugin], plugin=True, y=True, file=False, fetch=False, sclassic=False, first=False, description=False, manager=None, json=False))
+                print_status(f"Installed plugin: {plugin}", "success")
+            except Exception as e:
+                print_status(f"Failed to install plugin {plugin}: {e}", "error")
+        print("")
+
+    # --- Přidání repozitářů ---
+    repos = config.get("repos", [])
+    if repos:
+        print_status("Adding repositories...", "info")
+        for repo in repos:
+            if isinstance(repo, dict):
+                # Podpora podmínek
+                cond = repo.get("if")
+                if cond and not check_condition(cond):
+                    continue
+                pm = repo.get("manager")
+                url = repo.get("url")
+                if pm and url:
+                    try:
+                        handle_repo(argparse.Namespace(repo_command="add", repo=url, manager=pm, choose=False))
+                        print_status(f"Added repo {url} to {pm}", "success")
+                    except Exception as e:
+                        print_status(f"Failed to add repo {url}: {e}", "error")
+            elif isinstance(repo, str):
+                # Autodetekce
+                pm = None
+                if shutil.which("apt"):
+                    pm = "apt"
+                elif shutil.which("dnf"):
+                    pm = "dnf"
+                elif shutil.which("pacman"):
+                    pm = "pacman"
+                elif shutil.which("zypper"):
+                    pm = "zypper"
+                elif shutil.which("flatpak"):
+                    pm = "flatpak"
+                if pm:
+                    try:
+                        handle_repo(argparse.Namespace(repo_command="add", repo=repo, manager=pm, choose=False))
+                        print_status(f"Added repo {repo} to {pm}", "success")
+                    except Exception as e:
+                        print_status(f"Failed to add repo {repo}: {e}", "error")
+        print("")
+
+    # --- Vytvoření složek a souborů ---
+    if "mkdir" in config:
+        dirs = config["mkdir"]
+        if isinstance(dirs, str):
+            dirs = [dirs]
+        for d in dirs:
+            try:
+                os.makedirs(os.path.expanduser(d), exist_ok=True)
+                print_status(f"Created directory: {d}", "success")
+            except Exception as e:
+                print_status(f"Failed to create directory {d}: {e}", "error")
+
+    if "touch" in config:
+        files = config["touch"]
+        if isinstance(files, str):
+            files = [files]
+        for fpath in files:
+            try:
+                with open(os.path.expanduser(fpath), "a"):
+                    os.utime(os.path.expanduser(fpath), None)
+                print_status(f"Created file: {fpath}", "success")
+            except Exception as e:
+                print_status(f"Failed to create file {fpath}: {e}", "error")
+
+    # --- Better-pkg config ---
+    if "betterpkg_config" in config:
+        try:
+            save_config(config["betterpkg_config"])
+            print_status("better-pkg config updated.", "success")
+        except Exception as e:
+            print_status(f"Failed to update better-pkg config: {e}", "error")
+
+    # --- Spuštění příkazů ---
     commands = config.get("commands", [])
     if commands:
+        print("")
         if not isinstance(commands, list):
-            print_status("Commands section must be a list of strings.", "error")
+            print_status("Commands section must be a list of strings or dicts.", "error")
         else:
             for cmd in commands:
-                print_status(f"Running: {cmd}", "info")
+                cond = None
+                cmd_str = cmd
+                if isinstance(cmd, dict):
+                    cond = cmd.get("if")
+                    cmd_str = cmd.get("run")
+                if cond and not check_condition(cond):
+                    continue
+                if not cmd_str:
+                    continue
+                print_status(f"Running: {cmd_str}", "info")
                 print("")
                 try:
-                    subprocess.run(cmd, shell=True, check=True)
+                    subprocess.run(cmd_str, shell=True, check=True)
                 except Exception as e:
-                    print_status(f"Error running '{cmd}': {e}", "error")
+                    print_status(f"Error running '{cmd_str}': {e}", "error")
                 print("")
+
+    # --- Instalace balíčků ---
+    packages = config.get("packages", {})
+    flatpak_packages = config.get("flatpak", {})
+    brew_packages = config.get("brew", {})
+    installed_packages = []
+    print("")
 
     # Seskupení balíčků podle package manageru
     package_groups = {}
     for pkg, repos in packages.items():
         for repo in repos:
             if shutil.which(repo):
-                if repo not in package_groups:
-                    package_groups[repo] = []
-                package_groups[repo].append(pkg)
+                package_groups.setdefault(repo, []).append(pkg)
                 break
 
     # Instalace balíčků po skupinách
@@ -2367,6 +2516,81 @@ def setup_custom(args):
         install_package(brew_pkgs, "brew")
         installed_packages.extend([f"{pkg} (brew)" for pkg in brew_pkgs])
 
+    # --- Instalace ze souboru nebo URL ---
+    files = config.get("files", [])
+    if files:
+        print("")
+        print_status("Installing from files/URLs...", "info")
+        for file_path in files:
+            if file_path.startswith("http://") or file_path.startswith("https://"):
+                local_path = os.path.join("/tmp", os.path.basename(file_path.split("?")[0]))
+                try:
+                    subprocess.run(["wget", "-O", local_path, file_path], check=True)
+                    print_status(f"Downloaded {file_path} to {local_path}", "success")
+                    file_path = local_path
+                except Exception as e:
+                    print_status(f"Failed to download {file_path}: {e}", "error")
+                    continue
+            try:
+                install(argparse.Namespace(package=[file_path], file=True, plugin=False, fetch=False, sclassic=False, first=False, description=False, manager=None, y=True, json=False))
+                print_status(f"Installed from file: {file_path}", "success")
+            except Exception as e:
+                print_status(f"Failed to install from file {file_path}: {e}", "error")
+
+    # --- Akce (cleanup, update, atd.) ---
+    actions = config.get("actions", [])
+    if actions:
+        for action in actions:
+            if isinstance(action, dict):
+                cond = action.get("if")
+                act = action.get("run")
+                if cond and not check_condition(cond):
+                    continue
+            else:
+                act = action
+            print("")
+            if not act:
+                continue
+            if act == "cleanup":
+                print_status("Running cleanup...", "info")
+                handle_cleanup(argparse.Namespace(y=True))
+            elif act == "repair":
+                print_status("Running repair...", "info")
+                handle_repair(argparse.Namespace(y=True))
+            elif act == "update":
+                print_status("Running update...", "info")
+                handle_update(argparse.Namespace(y=True))
+            elif act == "upgrade":
+                print_status("Running upgrade...", "info")
+                handle_upgrade(argparse.Namespace(y=True, skip_pre_upgrade=False, use_native=False, skip_mirrors=False, skip_firmware=False, distro=False, unreleased=False))
+            else:
+                print_status(f"Unknown action: {act}", "warning")
+
+    # --- Spuštění příkazů po provedení ---
+    post_commands = config.get("post_commands", [])
+    if post_commands:
+        if not isinstance(post_commands, list):
+            print_status("post_commands section must be a list of strings or dicts.", "error")
+        else:
+            for cmd in post_commands:
+                cond = None
+                cmd_str = cmd
+                if isinstance(cmd, dict):
+                    cond = cmd.get("if")
+                    cmd_str = cmd.get("run")
+                if cond and not check_condition(cond):
+                    continue
+                if not cmd_str:
+                    continue
+                print_status(f"Running post-command: {cmd_str}", "info")
+                print("")
+                try:
+                    subprocess.run(cmd_str, shell=True, check=True)
+                except Exception as e:
+                    print_status(f"Error running '{cmd_str}': {e}", "error")
+                print("")
+
+    # --- Custom JSON Handlers ---
     for key, handler in CUSTOM_JSON_HANDLERS.items():
         if key in config:
             print("")
