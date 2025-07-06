@@ -2381,7 +2381,7 @@ def setup_custom(args):
         print("No packages were installed")
 
 def setup_remove(args):
-    """Remove custom packages from a configuration file."""
+    """Odstraní balíček z config souboru."""
 
     if not args.y:
         confirm = input("This will remove packages from the configuration file. Are you sure? (y/N) ").strip().lower()
@@ -2418,18 +2418,18 @@ def setup_remove(args):
                 package_groups[repo].append(pkg)
                 break
 
-    # Instalace balíčků po skupinách
+    # Odstranění balíčků po skupinách
     for repo, pkgs in package_groups.items():
         remove_package(pkgs, repo)
         installed_packages.extend([f"{pkg} ({repo})" for pkg in pkgs])
 
-    # Instalace flatpak balíčků
+    # Odstranění flatpak balíčků
     if flatpak_packages and shutil.which("flatpak"):
         flatpak_pkgs = list(flatpak_packages.keys())
         remove_package(flatpak_pkgs, "flatpak")
         installed_packages.extend([f"{pkg} (flatpak)" for pkg in flatpak_pkgs])
-
-    # Instalace Homebrew balíčků
+        
+    # Odstranění brew balíčků
     if brew_packages and shutil.which("brew"):
         brew_pkgs = list(brew_packages.keys())
         remove_package(brew_pkgs, "brew")
