@@ -2304,7 +2304,7 @@ def setup_custom(args):
 
     try:
         with open(args.config_file, 'r') as f:
-            config = json.load(f)
+            config = json.load(f, object_pairs_hook=list)  # load as list of pairs to preserve order
     except FileNotFoundError:
         print(f"Error: Configuration file '{args.config_file}' not found")
         return
@@ -2312,35 +2312,37 @@ def setup_custom(args):
         print(f"Error: Invalid JSON in configuration file '{args.config_file}'")
         return
 
-    if not isinstance(config, dict):
-        print("Error: Invalid configuration file format")
-        return
+    # Convert to list of pairs if not already (for compatibility)
+    if isinstance(config, dict):
+        config_items = list(config.items())
+    else:
+        config_items = config
 
     # --- Základní informace ---
     info_keys = ["name", "description", "created", "author", "version"]
     print(f"{colors.BWhite}Custom setup file info:{colors.NC}")
-    for key in info_keys:
-        if key in config:
-            print(f"{colors.BCyan}{key.capitalize()}: {colors.BGreen}{config[key]}{colors.NC}")
+    for key, value in config_items:
+        if key in info_keys:
+            print(f"{colors.BCyan}{key.capitalize()}: {colors.BGreen}{value}{colors.NC}")
     print("")
 
     # --- Poznámky ---
-    if "notes" in config:
-        print(f"{colors.BYellow}Notes:{colors.NC}")
-        notes = config["notes"]
-        if isinstance(notes, list):
-            for note in notes:
-                print(f"  - {note}")
-        else:
-            print(f"  {notes}")
-        print("")
+    for key, value in config_items:
+        if key == "notes":
+            print(f"{colors.BYellow}Notes:{colors.NC}")
+            notes = value
+            if isinstance(notes, list):
+                for note in notes:
+                    print(f"  - {note}")
+            else:
+                print(f"  {notes}")
+            print("")
 
     if not args.y:
         confirm = input("Do you want to run this setup? (y/N) ").strip().lower()
         if not confirm.startswith('y'):
             return
 
-    # --- Kontrola podmínek ---
     def check_condition(cond):
         # Jednoduché podmínky: distro, file exists, command exists, env var
         if not isinstance(cond, dict):
@@ -2376,226 +2378,224 @@ def setup_custom(args):
                         return False
         return True
 
-    # --- Instalace better-pkg pluginů ---
-    plugins = config.get("plugins", [])
-    if plugins:
-        print_status("Installing better-pkg plugins...", "info")
-        for plugin in plugins:
-            try:
-                install(argparse.Namespace(package=[plugin], plugin=True, y=True, file=False, fetch=False, sclassic=False, first=False, description=False, manager=None, json=False))
-                print_status(f"Installed plugin: {plugin}", "success")
-            except Exception as e:
-                print_status(f"Failed to install plugin {plugin}: {e}", "error")
-        print("")
-
-    # --- Přidání repozitářů ---
-    repos = config.get("repos", [])
-    if repos:
-        print_status("Adding repositories...", "info")
-        for repo in repos:
-            if isinstance(repo, dict):
-                # Podpora podmínek
-                cond = repo.get("if")
-                if cond and not check_condition(cond):
-                    continue
-                pm = repo.get("manager")
-                url = repo.get("url")
-                if pm and url:
-                    try:
-                        handle_repo(argparse.Namespace(repo_command="add", repo=url, manager=pm, choose=False))
-                        print_status(f"Added repo {url} to {pm}", "success")
-                    except Exception as e:
-                        print_status(f"Failed to add repo {url}: {e}", "error")
-            elif isinstance(repo, str):
-                # Autodetekce
-                pm = None
-                if shutil.which("apt"):
-                    pm = "apt"
-                elif shutil.which("dnf"):
-                    pm = "dnf"
-                elif shutil.which("pacman"):
-                    pm = "pacman"
-                elif shutil.which("zypper"):
-                    pm = "zypper"
-                elif shutil.which("flatpak"):
-                    pm = "flatpak"
-                if pm:
-                    try:
-                        handle_repo(argparse.Namespace(repo_command="add", repo=repo, manager=pm, choose=False))
-                        print_status(f"Added repo {repo} to {pm}", "success")
-                    except Exception as e:
-                        print_status(f"Failed to add repo {repo}: {e}", "error")
-        print("")
-
-    # --- Vytvoření složek a souborů ---
-    if "mkdir" in config:
-        dirs = config["mkdir"]
-        if isinstance(dirs, str):
-            dirs = [dirs]
-        for d in dirs:
-            try:
-                os.makedirs(os.path.expanduser(d), exist_ok=True)
-                print_status(f"Created directory: {d}", "success")
-            except Exception as e:
-                print_status(f"Failed to create directory {d}: {e}", "error")
-
-    if "touch" in config:
-        files = config["touch"]
-        if isinstance(files, str):
-            files = [files]
-        for fpath in files:
-            try:
-                with open(os.path.expanduser(fpath), "a"):
-                    os.utime(os.path.expanduser(fpath), None)
-                print_status(f"Created file: {fpath}", "success")
-            except Exception as e:
-                print_status(f"Failed to create file {fpath}: {e}", "error")
-
-    # --- Better-pkg config ---
-    if "betterpkg_config" in config:
-        try:
-            save_config(config["betterpkg_config"])
-            print_status("better-pkg config updated.", "success")
-        except Exception as e:
-            print_status(f"Failed to update better-pkg config: {e}", "error")
-
-    # --- Spuštění příkazů ---
-    commands = config.get("commands", [])
-    if commands:
-        print("")
-        if not isinstance(commands, list):
-            print_status("Commands section must be a list of strings or dicts.", "error")
-        else:
-            for cmd in commands:
-                cond = None
-                cmd_str = cmd
-                if isinstance(cmd, dict):
-                    cond = cmd.get("if")
-                    cmd_str = cmd.get("run")
-                if cond and not check_condition(cond):
-                    continue
-                if not cmd_str:
-                    continue
-                print_status(f"Running: {cmd_str}", "info")
-                print("")
-                try:
-                    subprocess.run(cmd_str, shell=True, check=True)
-                except Exception as e:
-                    print_status(f"Error running '{cmd_str}': {e}", "error")
-                print("")
-
-    # --- Instalace balíčků ---
-    packages = config.get("packages", {})
-    flatpak_packages = config.get("flatpak", {})
-    brew_packages = config.get("brew", {})
     installed_packages = []
-    print("")
 
-    # Seskupení balíčků podle package manageru
-    package_groups = {}
-    for pkg, repos in packages.items():
-        for repo in repos:
-            if shutil.which(repo):
-                package_groups.setdefault(repo, []).append(pkg)
-                break
+    # --- Zpracování všech položek podle pořadí v JSON ---
+    for key, value in config_items:
+        if key in ("name", "description", "created", "author", "version", "notes"):
+            continue  # základní info a poznámky už zpracováno
 
-    # Instalace balíčků po skupinách
-    for repo, pkgs in package_groups.items():
-        install_package(pkgs, repo)
-        installed_packages.extend([f"{pkg} ({repo})" for pkg in pkgs])
+        if key == "plugins":
+            plugins = value
+            if plugins:
+                print_status("Installing better-pkg plugins...", "info")
+                for plugin in plugins:
+                    try:
+                        install(argparse.Namespace(package=[plugin], plugin=True, y=True, file=False, fetch=False, sclassic=False, first=False, description=False, manager=None, json=False))
+                        print_status(f"Installed plugin: {plugin}", "success")
+                    except Exception as e:
+                        print_status(f"Failed to install plugin {plugin}: {e}", "error")
+                print("")
 
-    # Instalace flatpak balíčků
-    if flatpak_packages and shutil.which("flatpak"):
-        flatpak_pkgs = list(flatpak_packages.keys())
-        install_package(flatpak_pkgs, "flatpak")
-        installed_packages.extend([f"{pkg} (flatpak)" for pkg in flatpak_pkgs])
+        elif key == "repos":
+            repos = value
+            if repos:
+                print_status("Adding repositories...", "info")
+                for repo in repos:
+                    if isinstance(repo, dict):
+                        cond = repo.get("if")
+                        if cond and not check_condition(cond):
+                            continue
+                        pm = repo.get("manager")
+                        url = repo.get("url")
+                        if pm and url:
+                            try:
+                                handle_repo(argparse.Namespace(repo_command="add", repo=url, manager=pm, choose=False))
+                                print_status(f"Added repo {url} to {pm}", "success")
+                            except Exception as e:
+                                print_status(f"Failed to add repo {url}: {e}", "error")
+                    elif isinstance(repo, str):
+                        pm = None
+                        if shutil.which("apt"):
+                            pm = "apt"
+                        elif shutil.which("dnf"):
+                            pm = "dnf"
+                        elif shutil.which("pacman"):
+                            pm = "pacman"
+                        elif shutil.which("zypper"):
+                            pm = "zypper"
+                        elif shutil.which("flatpak"):
+                            pm = "flatpak"
+                        if pm:
+                            try:
+                                handle_repo(argparse.Namespace(repo_command="add", repo=repo, manager=pm, choose=False))
+                                print_status(f"Added repo {repo} to {pm}", "success")
+                            except Exception as e:
+                                print_status(f"Failed to add repo {repo}: {e}", "error")
+                print("")
 
-    # Instalace Homebrew balíčků
-    if brew_packages and shutil.which("brew"):
-        brew_pkgs = list(brew_packages.keys())
-        install_package(brew_pkgs, "brew")
-        installed_packages.extend([f"{pkg} (brew)" for pkg in brew_pkgs])
-
-    # --- Instalace ze souboru nebo URL ---
-    files = config.get("files", [])
-    if files:
-        print("")
-        print_status("Installing from files/URLs...", "info")
-        for file_path in files:
-            if file_path.startswith("http://") or file_path.startswith("https://"):
-                local_path = os.path.join("/tmp", os.path.basename(file_path.split("?")[0]))
+        elif key == "mkdir":
+            dirs = value
+            if isinstance(dirs, str):
+                dirs = [dirs]
+            for d in dirs:
                 try:
-                    subprocess.run(["wget", "-O", local_path, file_path], check=True)
-                    print_status(f"Downloaded {file_path} to {local_path}", "success")
-                    file_path = local_path
+                    os.makedirs(os.path.expanduser(d), exist_ok=True)
+                    print_status(f"Created directory: {d}", "success")
                 except Exception as e:
-                    print_status(f"Failed to download {file_path}: {e}", "error")
-                    continue
+                    print_status(f"Failed to create directory {d}: {e}", "error")
+
+        elif key == "touch":
+            files = value
+            if isinstance(files, str):
+                files = [files]
+            for fpath in files:
+                try:
+                    with open(os.path.expanduser(fpath), "a"):
+                        os.utime(os.path.expanduser(fpath), None)
+                    print_status(f"Created file: {fpath}", "success")
+                except Exception as e:
+                    print_status(f"Failed to create file {fpath}: {e}", "error")
+
+        elif key == "betterpkg_config":
             try:
-                install(argparse.Namespace(package=[file_path], file=True, plugin=False, fetch=False, sclassic=False, first=False, description=False, manager=None, y=True, json=False))
-                print_status(f"Installed from file: {file_path}", "success")
+                save_config(value)
+                print_status("better-pkg config updated.", "success")
             except Exception as e:
-                print_status(f"Failed to install from file {file_path}: {e}", "error")
+                print_status(f"Failed to update better-pkg config: {e}", "error")
 
-    # --- Akce (cleanup, update, atd.) ---
-    actions = config.get("actions", [])
-    if actions:
-        for action in actions:
-            if isinstance(action, dict):
-                cond = action.get("if")
-                act = action.get("run")
-                if cond and not check_condition(cond):
-                    continue
-            else:
-                act = action
-            print("")
-            if not act:
-                continue
-            if act == "cleanup":
-                print_status("Running cleanup...", "info")
-                handle_cleanup(argparse.Namespace(y=True))
-            elif act == "repair":
-                print_status("Running repair...", "info")
-                handle_repair(argparse.Namespace(y=True))
-            elif act == "update":
-                print_status("Running update...", "info")
-                handle_update(argparse.Namespace(y=True))
-            elif act == "upgrade":
-                print_status("Running upgrade...", "info")
-                handle_upgrade(argparse.Namespace(y=True, skip_pre_upgrade=False, use_native=False, skip_mirrors=False, skip_firmware=False, distro=False, unreleased=False))
-            else:
-                print_status(f"Unknown action: {act}", "warning")
+        elif key == "commands":
+            commands = value
+            if commands:
+                print("")
+                if not isinstance(commands, list):
+                    print_status("Commands section must be a list of strings or dicts.", "error")
+                else:
+                    for cmd in commands:
+                        cond = None
+                        cmd_str = cmd
+                        if isinstance(cmd, dict):
+                            cond = cmd.get("if")
+                            cmd_str = cmd.get("run")
+                        if cond and not check_condition(cond):
+                            continue
+                        if not cmd_str:
+                            continue
+                        print_status(f"Running: {cmd_str}", "info")
+                        print("")
+                        try:
+                            subprocess.run(cmd_str, shell=True, check=True)
+                        except Exception as e:
+                            print_status(f"Error running '{cmd_str}': {e}", "error")
+                        print("")
 
-    # --- Spuštění příkazů po provedení ---
-    post_commands = config.get("post_commands", [])
-    if post_commands:
-        if not isinstance(post_commands, list):
-            print_status("post_commands section must be a list of strings or dicts.", "error")
+        elif key == "packages":
+            packages = value
+            # Seskupení balíčků podle package manageru
+            package_groups = {}
+            for pkg, repos in packages.items():
+                for repo in repos:
+                    if shutil.which(repo):
+                        package_groups.setdefault(repo, []).append(pkg)
+                        break
+            for repo, pkgs in package_groups.items():
+                install_package(pkgs, repo)
+                installed_packages.extend([f"{pkg} ({repo})" for pkg in pkgs])
+
+        elif key == "flatpak":
+            flatpak_packages = value
+            if flatpak_packages and shutil.which("flatpak"):
+                flatpak_pkgs = list(flatpak_packages.keys())
+                install_package(flatpak_pkgs, "flatpak")
+                installed_packages.extend([f"{pkg} (flatpak)" for pkg in flatpak_pkgs])
+
+        elif key == "brew":
+            brew_packages = value
+            if brew_packages and shutil.which("brew"):
+                brew_pkgs = list(brew_packages.keys())
+                install_package(brew_pkgs, "brew")
+                installed_packages.extend([f"{pkg} (brew)" for pkg in brew_pkgs])
+
+        elif key == "files":
+            files = value
+            if files:
+                print("")
+                print_status("Installing from files/URLs...", "info")
+                for file_path in files:
+                    if file_path.startswith("http://") or file_path.startswith("https://"):
+                        local_path = os.path.join("/tmp", os.path.basename(file_path.split("?")[0]))
+                        try:
+                            subprocess.run(["wget", "-O", local_path, file_path], check=True)
+                            print_status(f"Downloaded {file_path} to {local_path}", "success")
+                            file_path = local_path
+                        except Exception as e:
+                            print_status(f"Failed to download {file_path}: {e}", "error")
+                            continue
+                    try:
+                        install(argparse.Namespace(package=[file_path], file=True, plugin=False, fetch=False, sclassic=False, first=False, description=False, manager=None, y=True, json=False))
+                        print_status(f"Installed from file: {file_path}", "success")
+                    except Exception as e:
+                        print_status(f"Failed to install from file {file_path}: {e}", "error")
+
+        elif key == "actions":
+            actions = value
+            if actions:
+                for action in actions:
+                    if isinstance(action, dict):
+                        cond = action.get("if")
+                        act = action.get("run")
+                        if cond and not check_condition(cond):
+                            continue
+                    else:
+                        act = action
+                    print("")
+                    if not act:
+                        continue
+                    if act == "cleanup":
+                        print_status("Running cleanup...", "info")
+                        handle_cleanup(argparse.Namespace(y=True))
+                    elif act == "repair":
+                        print_status("Running repair...", "info")
+                        handle_repair(argparse.Namespace(y=True))
+                    elif act == "update":
+                        print_status("Running update...", "info")
+                        handle_update(argparse.Namespace(y=True))
+                    elif act == "upgrade":
+                        print_status("Running upgrade...", "info")
+                        handle_upgrade(argparse.Namespace(y=True, skip_pre_upgrade=False, use_native=False, skip_mirrors=False, skip_firmware=False, distro=False, unreleased=False))
+                    else:
+                        print_status(f"Unknown action: {act}", "warning")
+
+        elif key == "post_commands":
+            post_commands = value
+            if post_commands:
+                if not isinstance(post_commands, list):
+                    print_status("post_commands section must be a list of strings or dicts.", "error")
+                else:
+                    for cmd in post_commands:
+                        cond = None
+                        cmd_str = cmd
+                        if isinstance(cmd, dict):
+                            cond = cmd.get("if")
+                            cmd_str = cmd.get("run")
+                        if cond and not check_condition(cond):
+                            continue
+                        if not cmd_str:
+                            continue
+                        print_status(f"Running post-command: {cmd_str}", "info")
+                        print("")
+                        try:
+                            subprocess.run(cmd_str, shell=True, check=True)
+                        except Exception as e:
+                            print_status(f"Error running '{cmd_str}': {e}", "error")
+                        print("")
+
         else:
-            for cmd in post_commands:
-                cond = None
-                cmd_str = cmd
-                if isinstance(cmd, dict):
-                    cond = cmd.get("if")
-                    cmd_str = cmd.get("run")
-                if cond and not check_condition(cond):
-                    continue
-                if not cmd_str:
-                    continue
-                print_status(f"Running post-command: {cmd_str}", "info")
+            # --- Custom JSON Handlers ---
+            if key in CUSTOM_JSON_HANDLERS:
                 print("")
-                try:
-                    subprocess.run(cmd_str, shell=True, check=True)
-                except Exception as e:
-                    print_status(f"Error running '{cmd_str}': {e}", "error")
-                print("")
-
-    # --- Custom JSON Handlers ---
-    for key, handler in CUSTOM_JSON_HANDLERS.items():
-        if key in config:
-            print("")
-            print_status(f"Processing custom handler for: {key}", "info")
-            handler(config[key])
+                print_status(f"Processing custom handler for: {key}", "info")
+                CUSTOM_JSON_HANDLERS[key](value)
 
     if installed_packages:
         print("\nInstalled packages:")
