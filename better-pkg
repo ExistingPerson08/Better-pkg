@@ -229,9 +229,9 @@ def setup_argparse():
     setup_parser.add_argument('--list-options', action='store_true', help='List available setup options')
 
     # Setup-custom command
-    setup_custom_parser = subparsers.add_parser('setup-custom', help='Install and setup packages from your own configuration file')
-    setup_custom_parser.add_argument('config_file', help='Path to the configuration file')
-    setup_custom_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+    _parser = subparsers.add_parser('setup-custom', help='Install and setup packages from your own configuration file')
+    _parser.add_argument('config_file', help='Path to the configuration file')
+    _parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
 
     # Setup-remove command
     setup_remove_parser = subparsers.add_parser('setup-remove', help='Remove packages from your own configuration file')
@@ -2304,7 +2304,8 @@ def setup_custom(args):
 
     try:
         with open(args.config_file, 'r') as f:
-            config = json.load(f, object_pairs_hook=list)  # load as list of pairs to preserve order
+            from collections import OrderedDict
+            config = json.load(f, object_pairs_hook=OrderedDict)
     except FileNotFoundError:
         print(f"Error: Configuration file '{args.config_file}' not found")
         return
@@ -2312,11 +2313,112 @@ def setup_custom(args):
         print(f"Error: Invalid JSON in configuration file '{args.config_file}'")
         return
 
-    # Convert to list of pairs if not already (for compatibility)
     if isinstance(config, dict):
         config_items = list(config.items())
     else:
         config_items = config
+
+    # --- Požadavky před spuštěním ---
+    requirements = None
+    for key, value in config_items:
+        if key == "requirements":
+            requirements = value
+            break
+
+    def check_req_condition(cond):
+        if not cond:
+            return True
+        if isinstance(cond, list):
+            return all(check_req_condition(c) for c in cond)
+        if not isinstance(cond, dict):
+            return True
+        # Desktop
+        if "desktop" in cond:
+            desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+            if not desktop:
+                if os.environ.get("GNOME_DESKTOP_SESSION_ID"):
+                    desktop = "gnome"
+                elif os.environ.get("KDE_FULL_SESSION"):
+                    desktop = "kde"
+                elif os.environ.get("DESKTOP_SESSION"):
+                    desktop = os.environ["DESKTOP_SESSION"].lower()
+            if not any(d.lower() in desktop for d in cond["desktop"]):
+                return False
+        # Packages
+        if "packages" in cond:
+            for pkg in cond["packages"]:
+                found = False
+                for pm in ["apt", "dnf", "pacman", "zypper"]:
+                    if shutil.which(pm):
+                        if pm == "apt":
+                            result = subprocess.run(f"dpkg -s {pkg}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            if result.returncode == 0:
+                                found = True
+                        elif pm == "dnf":
+                            result = subprocess.run(f"rpm -q {pkg}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            if result.returncode == 0:
+                                found = True
+                        elif pm == "pacman":
+                            result = subprocess.run(f"pacman -Q {pkg}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            if result.returncode == 0:
+                                found = True
+                        elif pm == "zypper":
+                            result = subprocess.run(f"rpm -q {pkg}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            if result.returncode == 0:
+                                found = True
+                if not found:
+                    return False
+        # Commands
+        if "commands" in cond:
+            for cmd in cond["commands"]:
+                result = subprocess.run(cmd, shell=True)
+                if result.returncode != 0:
+                    return False
+        # Env
+        if "env" in cond:
+            envs = cond["env"]
+            if isinstance(envs, str):
+                if envs not in os.environ:
+                    return False
+            elif isinstance(envs, dict):
+                for k, v in envs.items():
+                    if os.environ.get(k) != v:
+                        return False
+        # App-env (pro Flatpak/Snap)
+        if "app-env" in cond:
+            for k, v in cond["app-env"].items():
+                if os.environ.get(k) != v:
+                    return False
+        # systemd
+        if "systemd" in cond:
+            for service in cond["systemd"]:
+                result = subprocess.run(f"systemctl is-active {service}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                if not result.stdout.decode().strip() == "active":
+                    return False
+        # file_exists
+        if "file_exists" in cond:
+            files = cond["file_exists"]
+            if isinstance(files, str):
+                files = [files]
+            for f in files:
+                if not os.path.exists(os.path.expanduser(f)):
+                    return False
+        # command_exists
+        if "command_exists" in cond:
+            cmds = cond["command_exists"]
+            if isinstance(cmds, str):
+                cmds = [cmds]
+            for c in cmds:
+                if not shutil.which(c):
+                    return False
+        # custom (lambda string, eval)
+        if "custom" in cond:
+            try:
+                if not eval(cond["custom"]):
+                    return False
+            except Exception:
+                return False
+        return True
 
     # --- Základní informace ---
     info_keys = ["name", "description", "created", "author", "version"]
@@ -2337,6 +2439,39 @@ def setup_custom(args):
             else:
                 print(f"  {notes}")
             print("")
+
+    # --- Požadavky ---
+    if requirements:
+        failed = []
+        warnings = []
+        if isinstance(requirements, dict):
+            reqs = [requirements]
+        elif isinstance(requirements, list):
+            reqs = requirements
+        else:
+            reqs = []
+        for req in reqs:
+            if not isinstance(req, dict):
+                print_status(f"Warning: Skipping invalid requirement (not a dict): {req}", "warning")
+                return
+            cond = req.get("if")
+            msg = req.get("message", "Requirement not met.")
+            strict = req.get("strict", False)
+            if not check_req_condition(cond):
+                if strict:
+                    failed.append(msg)
+                else:
+                    warnings.append(msg)
+        if warnings:
+            print(f"{colors.BYellow}Warning: Some requirements are not met:{colors.NC}")
+            for w in warnings:
+                print(f"  - {w}")
+        if failed:
+            print(f"{colors.BRed}Error: Strict requirements are not met:{colors.NC}")
+            for f in failed:
+                print(f"  - {f}")
+            print_status("Aborting setup due to strict requirements.", "error")
+            return
 
     if not args.y:
         confirm = input("Do you want to run this setup? (y/N) ").strip().lower()
@@ -2382,8 +2517,10 @@ def setup_custom(args):
 
     # --- Zpracování všech položek podle pořadí v JSON ---
     for key, value in config_items:
-        if key in ("name", "description", "created", "author", "version", "notes"):
+        if key in ("name", "description", "created", "author", "version", "notes", "requirements"):
             continue  # základní info a poznámky už zpracováno
+
+        print("")
 
         if key == "plugins":
             plugins = value
@@ -2449,11 +2586,23 @@ def setup_custom(args):
             files = value
             if isinstance(files, str):
                 files = [files]
-            for fpath in files:
+            for fitem in files:
+                if isinstance(fitem, dict):
+                    fpath = fitem.get("path")
+                    content = fitem.get("content", "")
+                else:
+                    fpath = fitem
+                    content = None
                 try:
-                    with open(os.path.expanduser(fpath), "a"):
-                        os.utime(os.path.expanduser(fpath), None)
-                    print_status(f"Created file: {fpath}", "success")
+                    abs_path = os.path.expanduser(fpath)
+                    with open(abs_path, "a" if content is None else "w", encoding="utf-8") as f:
+                        if content is not None:
+                            f.write(content)
+                    os.utime(abs_path, None)
+                    if content is not None:
+                        print_status(f"Created file with content: {fpath}", "success")
+                    else:
+                        print_status(f"Created file: {fpath}", "success")
                 except Exception as e:
                     print_status(f"Failed to create file {fpath}: {e}", "error")
 
@@ -2463,6 +2612,53 @@ def setup_custom(args):
                 print_status("better-pkg config updated.", "success")
             except Exception as e:
                 print_status(f"Failed to update better-pkg config: {e}", "error")
+
+        elif key == "env":
+            envs = value
+            if isinstance(envs, dict):
+                for k, v in envs.items():
+                    os.environ[k] = str(v)
+                    print_status(f"Set environment variable: {k}={v}", "success")
+
+        elif key == "app-env":
+            app_envs = value
+            # Zde pouze upozornění, skutečné nastavení je na uživateli (např. Flatpak override)
+            if isinstance(app_envs, dict):
+                for k, v in app_envs.items():
+                    print_status(f"App environment variable (set manually if needed): {k}={v}", "info")
+
+        elif key == "systemd":
+            services = value
+            if isinstance(services, str):
+                services = [services]
+            for svc in services:
+                try:
+                    subprocess.run(f"sudo systemctl enable --now {svc}", shell=True, check=True)
+                    print_status(f"Enabled and started systemd service: {svc}", "success")
+                except Exception as e:
+                    print_status(f"Failed to enable/start systemd service {svc}: {e}", "error")
+
+        elif key == "files":
+            files = value if isinstance(value, list) else [value]
+            print("")
+            print_status("Installing from files/URLs...", "info")
+            for file_path in files:
+                orig_path = file_path
+                if file_path.startswith("http://") or file_path.startswith("https://"):
+                    local_path = os.path.join("/tmp", os.path.basename(file_path.split("?")[0]))
+                    try:
+                        subprocess.run(["wget", "-O", local_path, file_path], check=True)
+                        print_status(f"Downloaded {file_path} to {local_path}", "success")
+                        file_path = local_path
+                    except Exception as e:
+                        print_status(f"Failed to download {file_path}: {e}", "error")
+                    continue
+                try:
+                    install(argparse.Namespace(package=[file_path], file=True, plugin=False, fetch=False, sclassic=False, first=False, description=False, manager=None, y=True, json=False))
+                    print_status(f"Installed from file: {orig_path}", "success")
+                except Exception as e:
+                    print_status(f"Failed to install from file {orig_path}: {e}", "error")
+
 
         elif key == "commands":
             commands = value
@@ -2515,27 +2711,6 @@ def setup_custom(args):
                 brew_pkgs = list(brew_packages.keys())
                 install_package(brew_pkgs, "brew")
                 installed_packages.extend([f"{pkg} (brew)" for pkg in brew_pkgs])
-
-        elif key == "files":
-            files = value
-            if files:
-                print("")
-                print_status("Installing from files/URLs...", "info")
-                for file_path in files:
-                    if file_path.startswith("http://") or file_path.startswith("https://"):
-                        local_path = os.path.join("/tmp", os.path.basename(file_path.split("?")[0]))
-                        try:
-                            subprocess.run(["wget", "-O", local_path, file_path], check=True)
-                            print_status(f"Downloaded {file_path} to {local_path}", "success")
-                            file_path = local_path
-                        except Exception as e:
-                            print_status(f"Failed to download {file_path}: {e}", "error")
-                            continue
-                    try:
-                        install(argparse.Namespace(package=[file_path], file=True, plugin=False, fetch=False, sclassic=False, first=False, description=False, manager=None, y=True, json=False))
-                        print_status(f"Installed from file: {file_path}", "success")
-                    except Exception as e:
-                        print_status(f"Failed to install from file {file_path}: {e}", "error")
 
         elif key == "actions":
             actions = value
