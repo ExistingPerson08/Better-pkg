@@ -229,9 +229,9 @@ def setup_argparse():
     setup_parser.add_argument('--list-options', action='store_true', help='List available setup options')
 
     # Setup-custom command
-    _parser = subparsers.add_parser('setup-custom', help='Install and setup packages from your own configuration file')
-    _parser.add_argument('config_file', help='Path to the configuration file')
-    _parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
+    setup_custom_parser = subparsers.add_parser('setup-custom', help='Install and setup packages from your own configuration file')
+    setup_custom_parser.add_argument('config_file', help='Path to the configuration file')
+    setup_custom_parser.add_argument('-y', action='store_true', help='Automatic yes to prompts')
 
     # Setup-remove command
     setup_remove_parser = subparsers.add_parser('setup-remove', help='Remove packages from your own configuration file')
