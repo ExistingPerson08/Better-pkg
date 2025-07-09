@@ -2851,6 +2851,10 @@ def setup_export(args):
 
     colors = Colors()
     config = {
+        "name": "Exported-setup",
+        "description": "Exported setup using better-pkg setup-export.",
+        "author": "Automatic-export",
+        "version": "1.0",
         "packages": {},
         "flatpak": {},
         "brew": {},
