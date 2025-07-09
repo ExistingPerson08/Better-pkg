@@ -2853,8 +2853,9 @@ def setup_export(args):
     config = {
         "name": "Exported-setup",
         "description": "Exported setup using better-pkg setup-export.",
-        "author": "Automatic-export",
+        "author": getpass.getuser(),
         "version": "1.0",
+        "created": datetime.datetime.now().isoformat(),
         "packages": {},
         "flatpak": {},
         "brew": {},
