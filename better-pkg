@@ -2848,6 +2848,7 @@ def setup_export(args):
     import glob
     import configparser
     from time import sleep
+    import getpass
 
     colors = Colors()
     config = {
